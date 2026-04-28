@@ -283,7 +283,11 @@ class ProcessRegistry:
     def _terminate_host_pid(pid: int) -> None:
         """Terminate a host-visible PID without requiring the original process handle."""
         if _IS_WINDOWS:
-            os.kill(pid, signal.SIGTERM)
+            # os.killpg is not available on Windows.
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError, PermissionError):
+                pass
             return
 
         try:
@@ -338,7 +342,11 @@ class ProcessRegistry:
             # Try PTY mode for interactive CLI tools
             try:
                 if _IS_WINDOWS:
-                    from winpty import PtyProcess as _PtyProcessCls
+                    try:
+                        from winpty import PtyProcess as _PtyProcessCls
+                    except ImportError:
+                        # Fall back to checking if we can use pipe mode
+                        raise ImportError("winpty not installed")
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
@@ -809,7 +817,7 @@ class ProcessRegistry:
                         session.process.terminate()
                     else:
                         os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
+                except (ProcessLookupError, PermissionError, OSError):
                     session.process.kill()
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox

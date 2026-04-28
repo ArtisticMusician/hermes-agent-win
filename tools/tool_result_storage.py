@@ -24,7 +24,9 @@ Defense against context-window overflow operates at three levels:
 
 import logging
 import os
+import platform
 import shlex
+import tempfile
 import uuid
 
 from tools.budget_config import (
@@ -36,7 +38,11 @@ from tools.budget_config import (
 logger = logging.getLogger(__name__)
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
-STORAGE_DIR = "/tmp/hermes-results"
+
+_IS_WINDOWS = platform.system() == "Windows"
+_FALLBACK_TMP = tempfile.gettempdir() if _IS_WINDOWS else "/tmp"
+STORAGE_DIR = os.path.join(_FALLBACK_TMP, "hermes-results")
+
 HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 

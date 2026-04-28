@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import platform
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -426,17 +427,21 @@ class ShellFileOperations(FileOperations):
     def _expand_path(self, path: str) -> str:
         """
         Expand shell-style paths like ~ and ~user to absolute paths.
-        
+
         This must be done BEFORE shell escaping, since ~ doesn't expand
         inside single quotes.
         """
         if not path:
             return path
-        
+
+        is_windows = platform.system() == "Windows"
+
         # Handle ~ and ~user
         if path.startswith('~'):
             # Get home directory via the terminal environment
-            result = self._exec("echo $HOME")
+            # On Windows/Git Bash, $HOME is usually set, but fall back to $USERPROFILE.
+            home_cmd = "echo ${HOME:-$USERPROFILE}" if is_windows else "echo $HOME"
+            result = self._exec(home_cmd)
             if result.exit_code == 0 and result.stdout.strip():
                 home = result.stdout.strip()
                 if path == '~':

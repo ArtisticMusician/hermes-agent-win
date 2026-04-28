@@ -5,6 +5,7 @@ import errno
 import json
 import logging
 import os
+import platform
 import threading
 from pathlib import Path
 from typing import Optional
@@ -76,6 +77,9 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     "/dev/stdout", "/dev/stderr",
     # fd aliases
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
+    # Windows
+    "NUL", "CON", "PRN", "AUX", "COM1", "COM2", "COM3", "COM4",
+    "LPT1", "LPT2", "LPT3",
 })
 
 
@@ -146,6 +150,7 @@ def _is_blocked_device(filepath: str) -> bool:
 _SENSITIVE_PATH_PREFIXES = (
     "/etc/", "/boot/", "/usr/lib/systemd/",
     "/private/etc/", "/private/var/",
+    "C:\\Windows\\", "C:\\Program Files\\", "C:\\Program Files (x86)\\",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
@@ -161,8 +166,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    is_windows = platform.system() == "Windows"
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if is_windows and prefix[1:2] == ":":
+            if resolved.lower().startswith(prefix.lower()) or normalized.lower().startswith(prefix.lower()):
+                return _err
+        elif resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err

@@ -48,6 +48,7 @@ screencapture -w -o /tmp/findmy.png
 
 Then use `vision_analyze` to read the screenshot:
 ```
+# Unix/macOS:
 vision_analyze(image_url="/tmp/findmy.png", question="What devices/items are shown and what are their locations?")
 ```
 

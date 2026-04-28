@@ -140,12 +140,20 @@ from pixel_art import pixel_art
 from pixel_art_video import pixel_art_video
 
 # 1. Convert to pixel art
+# Unix/macOS:
 pixel_art("/path/to/photo.jpg", "/tmp/pixel.png", preset="nes")
+# Windows:
+pixel_art("C:/path/to/photo.jpg", "C:/Temp/pixel.png", preset="nes")
 
 # 2. Animate (optional)
+# Unix/macOS:
 pixel_art_video(
     "/tmp/pixel.png",
     "/tmp/pixel.mp4",
+# Windows:
+pixel_art_video(
+    "C:/Temp/pixel.png",
+    "C:/Temp/pixel.mp4",
     scene="night",
     duration=6,
     fps=15,

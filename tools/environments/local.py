@@ -322,15 +322,16 @@ class LocalEnvironment(BaseEnvironment):
         """
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
-            if candidate and candidate.startswith("/"):
-                return candidate.rstrip("/") or "/"
+            if candidate:
+                if candidate.startswith("/") or (_IS_WINDOWS and ":" in candidate):
+                    return candidate.rstrip("/") or "/"
 
-        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
+        if not _IS_WINDOWS and os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
             return "/tmp"
 
         candidate = tempfile.gettempdir()
-        if candidate.startswith("/"):
-            return candidate.rstrip("/") or "/"
+        if candidate.startswith("/") or (_IS_WINDOWS and ":" in candidate):
+            return candidate.rstrip("/\\") or "/"
 
         return "/tmp"
 
@@ -373,6 +374,8 @@ class LocalEnvironment(BaseEnvironment):
         """Kill the entire process group (all children)."""
         try:
             if _IS_WINDOWS:
+                # Windows Popen with shell=True/False doesn't natively support
+                # process groups via os.setsid.
                 proc.terminate()
             else:
                 pgid = os.getpgid(proc.pid)
@@ -381,7 +384,7 @@ class LocalEnvironment(BaseEnvironment):
                     proc.wait(timeout=1.0)
                 except subprocess.TimeoutExpired:
                     os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
             except Exception:
