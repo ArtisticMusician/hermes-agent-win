@@ -4518,7 +4518,12 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             print("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
     print("→ Building web UI...")
-    r1 = subprocess.run([npm, "install", "--silent"], cwd=web_dir, capture_output=True)
+    r1 = subprocess.run(
+        [npm, "install", "--silent"],
+        cwd=web_dir,
+        capture_output=True,
+        shell=sys.platform == "win32",
+    )
     if r1.returncode != 0:
         print(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
@@ -4527,7 +4532,12 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         if fatal:
             print("  Run manually:  cd web && npm install && npm run build")
         return False
-    r2 = subprocess.run([npm, "run", "build"], cwd=web_dir, capture_output=True)
+    r2 = subprocess.run(
+        [npm, "run", "build"],
+        cwd=web_dir,
+        capture_output=True,
+        shell=sys.platform == "win32",
+    )
     if r2.returncode != 0:
         print(
             f"  {'✗' if fatal else '⚠'} Web UI build failed"

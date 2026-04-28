@@ -14,6 +14,7 @@ import hmac
 import importlib.util
 import json
 import logging
+import mimetypes
 import os
 import secrets
 import subprocess
@@ -26,6 +27,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+
+# Explicitly add common web MIME types to ensure correct serving on Windows
+# regardless of registry settings.
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("application/javascript", ".mjs")
+mimetypes.add_type("text/css", ".css")
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
@@ -60,7 +67,11 @@ except ImportError:
         f"Install with: {sys.executable} -m pip install 'fastapi' 'uvicorn[standard]'"
     )
 
-WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
+WEB_DIST = (
+    Path(os.environ["HERMES_WEB_DIST"]).resolve()
+    if "HERMES_WEB_DIST" in os.environ
+    else (Path(__file__).parent / "web_dist").resolve()
+)
 _log = logging.getLogger(__name__)
 
 app = FastAPI(title="Hermes Agent", version=__version__)
@@ -2283,7 +2294,7 @@ def mount_spa(application: FastAPI):
 
     def _serve_index():
         """Return index.html with the session token injected."""
-        html = _index_path.read_text()
+        html = _index_path.read_text(encoding="utf-8")
         token_script = (
             f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";</script>'
         )
@@ -2293,7 +2304,7 @@ def mount_spa(application: FastAPI):
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
 
-    application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    application.mount("/assets", StaticFiles(directory=str(WEB_DIST / "assets")), name="assets")
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str):
