@@ -14,6 +14,7 @@ import hmac
 import importlib.util
 import json
 import logging
+import ntpath
 import os
 import secrets
 import subprocess
@@ -2299,6 +2300,10 @@ def mount_spa(application: FastAPI):
     async def serve_spa(full_path: str):
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
+        drive, tail = ntpath.splitdrive(full_path)
+        tail = tail.lstrip('\\/')
+        file_path = WEB_DIST / tail
+
         if (
             full_path
             and file_path.resolve().is_relative_to(WEB_DIST.resolve())
@@ -2729,7 +2734,9 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
         raise HTTPException(status_code=404, detail="Plugin not found")
 
     base = Path(plugin["_dir"])
-    target = (base / file_path).resolve()
+    drive, tail = ntpath.splitdrive(file_path)
+    tail = tail.lstrip('\\/')
+    target = (base / tail).resolve()
 
     if not target.is_relative_to(base.resolve()):
         raise HTTPException(status_code=403, detail="Path traversal blocked")

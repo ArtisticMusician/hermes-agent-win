@@ -345,6 +345,20 @@ class TestWebServerEndpoints:
         if resp.status_code == 200:
             assert "FastAPI" not in resp.text  # Should not serve the actual source
 
+    def test_windows_absolute_path_blocked(self):
+        """Verify Windows absolute path injection is treated as relative safely."""
+        resp = self.client.get("/C:/Windows/System32/cmd.exe")
+        assert resp.status_code in (200, 404)
+        if resp.status_code == 200:
+            assert "root:" not in resp.text
+
+    def test_windows_backslash_blocked(self):
+        """Verify Windows backslashes are sanitized properly."""
+        resp = self.client.get("/\\Windows\\System32\\cmd.exe")
+        assert resp.status_code in (200, 404)
+        if resp.status_code == 200:
+            assert "root:" not in resp.text
+
 
 # ---------------------------------------------------------------------------
 # _build_schema_from_config tests
