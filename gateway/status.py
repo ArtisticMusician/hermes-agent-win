@@ -1,3 +1,4 @@
+from agent.platform import platform_info, ProcessManager
 """
 Gateway runtime status helpers.
 
@@ -6,7 +7,7 @@ used by send_message's check_fn to gate availability in the CLI.
 
 The PID file lives at ``{HERMES_HOME}/gateway.pid``.  HERMES_HOME defaults to
 ``~/.hermes`` but can be overridden via the environment variable.  This means
-separate HERMES_HOME directories naturally get separate PID files — a property
+separate HERMES_HOME directories naturally get separate PID files - a property
 that will be useful when we add named profiles (multiple agents running
 concurrently under distinct configurations).
 """
@@ -21,7 +22,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
-from utils import atomic_json_write
 
 if sys.platform == "win32":
     import msvcrt
@@ -31,14 +31,10 @@ else:
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
 _LOCKS_DIRNAME = "gateway-locks"
-_IS_WINDOWS = sys.platform == "win32"
+
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
-# Windows byte-range locks are mandatory for other readers. Lock a byte well
-# past the JSON payload so runtime status / PID readers can still read the file
-# while another process holds the mutual-exclusion lock.
-_WINDOWS_LOCK_OFFSET = 1024 * 1024
 
 
 def _get_pid_path() -> Path:
@@ -79,7 +75,7 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
     """
-    if force and _IS_WINDOWS:
+    if force and platform_info.is_windows:
         try:
             result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -110,10 +106,28 @@ def _get_scope_lock_path(scope: str, identity: str) -> Path:
 
 def _get_process_start_time(pid: int) -> Optional[int]:
     """Return the kernel start time for a process when available."""
+    if platform_info.is_windows:
+        try:
+            result = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CreationDate", "/FORMAT:LIST"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if line.startswith("CreationDate="):
+                        # Returns YYYYMMDDHHMMSS.mmmmmmsUUU
+                        val = line.split("=", 1)[1].strip().split(".")[0]
+                        return int(val)
+        except Exception:
+            pass
+        return None
+
     stat_path = Path(f"/proc/{pid}/stat")
     try:
         # Field 22 in /proc/<pid>/stat is process start time (clock ticks).
-        return int(stat_path.read_text(encoding="utf-8").split()[21])
+        return int(stat_path.read_text().split()[21])
     except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
         return None
 
@@ -124,44 +138,32 @@ def get_process_start_time(pid: int) -> Optional[int]:
 
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
-    """Return the process command line as a space-separated string.
+    """Return the process command line as a space-separated string."""
+    if platform_info.is_windows:
+        try:
+            result = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/FORMAT:LIST"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if line.startswith("CommandLine="):
+                        return line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+        return None
 
-    On Linux, reads /proc/<pid>/cmdline directly.  On macOS and other
-    platforms without /proc, falls back to ``ps -p <pid> -o command=``.
-    On Windows (no /proc, no ps), uses psutil.
-    """
     cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
         raw = cmdline_path.read_bytes()
     except (FileNotFoundError, PermissionError, OSError):
-        pass
-    else:
-        if raw:
-            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+        return None
 
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-
-    # Windows fallback: psutil (already used by _pid_exists)
-    try:
-        import psutil  # type: ignore
-        proc = psutil.Process(pid)
-        cmdline_parts = proc.cmdline()
-        if cmdline_parts:
-            return " ".join(cmdline_parts)
-    except Exception:
-        pass
-
-    return None
+    if not raw:
+        return None
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
 
 
 def _looks_like_gateway_process(pid: int) -> bool:
@@ -170,6 +172,8 @@ def _looks_like_gateway_process(pid: int) -> bool:
     if not cmdline:
         return False
 
+    # Normalize to forward slashes for matching
+    cmdline_norm = cmdline.replace("\\", "/")
     patterns = (
         "hermes_cli.main gateway",
         "hermes_cli/main.py gateway",
@@ -177,7 +181,7 @@ def _looks_like_gateway_process(pid: int) -> bool:
         "hermes-gateway",
         "gateway/run.py",
     )
-    return any(pattern in cmdline for pattern in patterns)
+    return any(pattern in cmdline_norm for pattern in patterns)
 
 
 def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
@@ -189,15 +193,17 @@ def _record_looks_like_gateway(record: dict[str, Any]) -> bool:
     if not isinstance(argv, list) or not argv:
         return False
 
-    # Normalize Windows backslashes so patterns match cross-platform.
-    cmdline = " ".join(str(part) for part in argv).replace("\\", "/")
+    cmdline = " ".join(str(part) for part in argv)
+    # Normalize to forward slashes for matching
+    cmdline_norm = cmdline.replace("\\", "/")
     patterns = (
         "hermes_cli.main gateway",
         "hermes_cli/main.py gateway",
         "hermes gateway",
+        "hermes-gateway",
         "gateway/run.py",
     )
-    return any(pattern in cmdline for pattern in patterns)
+    return any(pattern in cmdline_norm for pattern in patterns)
 
 
 def _build_pid_record() -> dict:
@@ -226,7 +232,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        raw = path.read_text().strip()
     except OSError:
         return None
     if not raw:
@@ -239,7 +245,8 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
@@ -249,9 +256,10 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
 
     try:
         raw = pid_path.read_text().strip()
-    except OSError:
-        # File was deleted between exists() and read_text(), or permission flipped.
+    except (PermissionError, OSError):
+        # On Windows, mandatory locks can block read access.
         return None
+
     if not raw:
         return None
 
@@ -284,15 +292,6 @@ def _pid_from_record(record: Optional[dict[str, Any]]) -> Optional[int]:
 
 
 def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
-    """Delete a stale gateway PID file (and its sibling lock metadata).
-
-    Called from ``get_running_pid()`` after the runtime lock has already been
-    confirmed inactive, so the on-disk metadata is known to belong to a dead
-    process.  Unlike ``remove_pid_file()`` (which defensively refuses to delete
-    a PID file whose ``pid`` field differs from ``os.getpid()`` to protect
-    ``--replace`` handoffs), this path force-unlinks both files so the next
-    startup sees a clean slate.
-    """
     if not cleanup_stale:
         return
     try:
@@ -318,12 +317,12 @@ def _write_gateway_lock_record(handle) -> None:
 
 def _try_acquire_file_lock(handle) -> bool:
     try:
-        if _IS_WINDOWS:
+        if platform_info.is_windows:
             handle.seek(0, os.SEEK_END)
             if handle.tell() == 0:
                 handle.write("\n")
                 handle.flush()
-            handle.seek(_WINDOWS_LOCK_OFFSET)
+            handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -332,85 +331,10 @@ def _try_acquire_file_lock(handle) -> bool:
         return False
 
 
-def _pid_exists(pid: int) -> bool:
-    """Cross-platform "is this PID alive" check that does NOT kill the target.
-
-    CRITICAL on Windows: Python's ``os.kill(pid, 0)`` is NOT a no-op like it
-    is on POSIX. CPython's Windows implementation
-    (``Modules/posixmodule.c::os_kill_impl``) treats ``sig=0`` as
-    ``CTRL_C_EVENT`` because the two values collide at the C level, and
-    routes it through ``GenerateConsoleCtrlEvent(0, pid)`` — which sends
-    a Ctrl+C to the entire console process group containing the target
-    PID, not just the PID itself. Any caller that wanted to "check if
-    this PID is alive" via ``os.kill(pid, 0)`` on Windows was silently
-    killing that process (and often unrelated processes in the same
-    console group). Long-standing Python quirk; see bpo-14484.
-
-    Implementation: prefer :mod:`psutil` (hard dependency — the canonical
-    cross-platform answer, maintained by Giampaolo Rodolà, uses
-    ``OpenProcess + GetExitCodeProcess`` on Windows internally). Fall back
-    to a hand-rolled ctypes ``OpenProcess`` / ``WaitForSingleObject`` pair
-    on Windows + ``os.kill(pid, 0)`` on POSIX if psutil is somehow
-    unavailable — e.g. stripped-down install or import error during the
-    scaffold phase before ``psutil`` is pip-installed.
-    """
-    try:
-        import psutil  # type: ignore
-        return bool(psutil.pid_exists(int(pid)))
-    except ImportError:
-        pass  # Fall through to stdlib fallback.
-
-    if _IS_WINDOWS:
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-            # Pin return types — default ctypes restype is c_int (signed),
-            # which mangles WAIT_* DWORD return codes into negative numbers.
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.WaitForSingleObject.restype = ctypes.c_uint
-            kernel32.GetLastError.restype = ctypes.c_uint
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            SYNCHRONIZE = 0x100000  # required for WaitForSingleObject
-            WAIT_TIMEOUT = 0x00000102
-            ERROR_INVALID_PARAMETER = 87
-            ERROR_ACCESS_DENIED = 5
-            handle = kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid)
-            )
-            if not handle:
-                err = kernel32.GetLastError()
-                if err == ERROR_INVALID_PARAMETER:
-                    return False  # PID definitely gone
-                if err == ERROR_ACCESS_DENIED:
-                    return True   # Exists but owned by another user/session
-                return False      # Conservative default for unknown errors
-            try:
-                wait_result = kernel32.WaitForSingleObject(handle, 0)
-                # WAIT_TIMEOUT = still running; anything else (WAIT_OBJECT_0
-                # via exit, WAIT_FAILED via handle issue) = treat as gone.
-                return wait_result == WAIT_TIMEOUT
-            finally:
-                kernel32.CloseHandle(handle)
-        except (OSError, AttributeError):
-            return False
-    else:
-        try:
-            os.kill(int(pid), 0)  # windows-footgun: ok — POSIX-only branch (the whole point of _pid_exists)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # Process exists but we can't signal it — still alive.
-            return True
-        except OSError:
-            return False
-
-
-
 def _release_file_lock(handle) -> None:
     try:
-        if _IS_WINDOWS:
-            handle.seek(_WINDOWS_LOCK_OFFSET)
+        if platform_info.is_windows:
+            handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -463,7 +387,13 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     if not resolved_lock_path.exists():
         return False
 
-    handle = open(resolved_lock_path, "a+", encoding="utf-8")
+    try:
+        handle = open(resolved_lock_path, "a+", encoding="utf-8")
+    except (PermissionError, OSError):
+        # On Windows, if the file is locked, open() can fail with
+        # PermissionError. Treat this as an active lock.
+        return True
+
     try:
         if _try_acquire_file_lock(handle):
             _release_file_lock(handle)
@@ -515,12 +445,10 @@ def write_runtime_status(
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
-    current_record = _build_pid_record()
     payload.setdefault("platforms", {})
-    payload["kind"] = current_record["kind"]
-    payload["pid"] = current_record["pid"]
-    payload["argv"] = current_record["argv"]
-    payload["start_time"] = current_record["start_time"]
+    payload.setdefault("kind", _GATEWAY_KIND)
+    payload["pid"] = os.getpid()
+    payload["start_time"] = _get_process_start_time(os.getpid())
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:
@@ -568,7 +496,7 @@ def remove_pid_file() -> None:
             except (KeyError, TypeError, ValueError):
                 file_pid = None
             if file_pid is not None and file_pid != os.getpid():
-                # PID file belongs to a different process — leave it alone.
+                # PID file belongs to a different process - leave it alone.
                 return
         path.unlink(missing_ok=True)
     except Exception:
@@ -593,7 +521,7 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
     existing = _read_json_file(lock_path)
     if existing is None and lock_path.exists():
-        # Lock file exists but is empty or contains invalid JSON — treat as
+        # Lock file exists but is empty or contains invalid JSON - treat as
         # stale.  This happens when a previous process was killed between
         # O_CREAT|O_EXCL and the subsequent json.dump() (e.g. DNS failure
         # during rapid Slack reconnect retries).
@@ -613,7 +541,10 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
 
         stale = existing_pid is None
         if not stale:
-            if not _pid_exists(existing_pid):
+            try:
+                os.kill(existing_pid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                # Windows raises OSError with WinError 87 for invalid pid check
                 stale = True
             else:
                 current_start = _get_process_start_time(existing_pid)
@@ -623,33 +554,17 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                     and current_start != existing.get("start_time")
                 ):
                     stale = True
-                # When start_time comparison is unavailable (macOS / Windows
-                # have no /proc, so both sides are None), fall back to
-                # checking the live process command line.  When cmdline is
-                # also unreadable (Windows has no ps), consult the lock
-                # record's own argv — the gateway writes it at startup and
-                # it's the only identity signal on platforms without ps.
-                # Both oracles must indicate "not a gateway" to mark stale.
-                if (
-                    not stale
-                    and existing.get("start_time") is None
-                    and current_start is None
-                    and not _looks_like_gateway_process(existing_pid)
-                ):
-                    live_cmdline = _read_process_cmdline(existing_pid)
-                    if live_cmdline is not None or not _record_looks_like_gateway(existing):
-                        stale = True
-                # Check if process is stopped (Ctrl+Z / SIGTSTP) — stopped
-                # processes still appear alive to _pid_exists but are not
+                # Check if process is stopped (Ctrl+Z / SIGTSTP) - stopped
+                # processes still respond to os.kill(pid, 0) but are not
                 # actually running. Treat them as stale so --replace works.
-                if not stale:
+                if not stale and not platform_info.is_windows:
                     try:
                         _proc_status = Path(f"/proc/{existing_pid}/status")
                         if _proc_status.exists():
-                            for _line in _proc_status.read_text(encoding="utf-8").splitlines():
+                            for _line in _proc_status.read_text().splitlines():
                                 if _line.startswith("State:"):
                                     _state = _line.split()[1]
-                                    if _state in {"T", "t"}:  # stopped or tracing stop
+                                    if _state in ("T", "t"):  # stopped or tracing stop
                                         stale = True
                                     break
                     except (OSError, PermissionError):
@@ -739,29 +654,9 @@ def release_all_scoped_locks(
     return removed
 
 
-# ── --replace takeover marker ─────────────────────────────────────────
-#
-# When a new gateway starts with ``--replace``, it SIGTERMs the existing
-# gateway so it can take over the bot token. PR #5646 made SIGTERM exit
-# the gateway with code 1 so ``Restart=on-failure`` can revive it after
-# unexpected kills — but that also means a --replace takeover target
-# exits 1, which tricks systemd into reviving it 30 seconds later,
-# starting a flap loop against the replacer when both services are
-# enabled in the user's systemd (e.g. ``hermes.service`` + ``hermes-
-# gateway.service``).
-#
-# The takeover marker breaks the loop: the replacer writes a short-lived
-# file naming the target PID + start_time BEFORE sending SIGTERM.
-# The target's shutdown handler reads the marker and, if it names
-# this process, treats the SIGTERM as a planned takeover and exits 0.
-# The marker is unlinked after the target has consumed it, so a stale
-# marker left by a crashed replacer can grief at most one future
-# shutdown on the same PID — and only within _TAKEOVER_MARKER_TTL_S.
-
+# -- --replace takeover marker -----------------------------------------
 _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
-_TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
-_PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
-_PLANNED_STOP_MARKER_TTL_S = 60
+_TAKEOVER_MARKER_TTL_S = 60
 
 
 def _get_takeover_marker_path() -> Path:
@@ -770,35 +665,30 @@ def _get_takeover_marker_path() -> Path:
     return home / _TAKEOVER_MARKER_FILENAME
 
 
-def _get_planned_stop_marker_path() -> Path:
-    """Return the path to the intentional gateway stop marker file."""
-    home = get_hermes_home()
-    return home / _PLANNED_STOP_MARKER_FILENAME
-
-
-def _marker_is_stale(written_at: str, ttl_s: int) -> bool:
+def write_takeover_marker(target_pid: int) -> bool:
     try:
-        written_dt = datetime.fromisoformat(written_at)
-        age = (datetime.now(timezone.utc) - written_dt).total_seconds()
-        return age > ttl_s
-    except (TypeError, ValueError):
+        target_start_time = _get_process_start_time(target_pid)
+        record = {
+            "target_pid": target_pid,
+            "target_start_time": target_start_time,
+            "replacer_pid": os.getpid(),
+            "written_at": _utc_now_iso(),
+        }
+        _write_json_file(_get_takeover_marker_path(), record)
         return True
+    except (OSError, PermissionError):
+        return False
 
 
-def _consume_pid_marker_for_self(
-    path: Path,
-    *,
-    pid_field: str,
-    start_time_field: str,
-    ttl_s: int,
-) -> bool:
+def consume_takeover_marker_for_self() -> bool:
+    path = _get_takeover_marker_path()
     record = _read_json_file(path)
     if not record:
         return False
 
     try:
-        target_pid = int(record[pid_field])
-        target_start_time = record.get(start_time_field)
+        target_pid = int(record["target_pid"])
+        target_start_time = record.get("target_start_time")
         written_at = record.get("written_at") or ""
     except (KeyError, TypeError, ValueError):
         try:
@@ -807,7 +697,16 @@ def _consume_pid_marker_for_self(
             pass
         return False
 
-    if _marker_is_stale(written_at, ttl_s):
+    stale = False
+    try:
+        written_dt = datetime.fromisoformat(written_at)
+        age = (datetime.now(timezone.utc) - written_dt).total_seconds()
+        if age > _TAKEOVER_MARKER_TTL_S:
+            stale = True
+    except (TypeError, ValueError):
+        stale = True
+
+    if stale:
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -831,95 +730,25 @@ def _consume_pid_marker_for_self(
     return matches
 
 
-def write_takeover_marker(target_pid: int) -> bool:
-    """Record that ``target_pid`` is being replaced by the current process.
-
-    Captures the target's ``start_time`` so that PID reuse after the
-    target exits cannot later match the marker. Also records the
-    replacer's PID and a UTC timestamp for TTL-based staleness checks.
-
-    Returns True on successful write, False on any failure. The caller
-    should proceed with the SIGTERM even if the write fails (the marker
-    is a best-effort signal, not a correctness requirement).
-    """
-    try:
-        target_start_time = _get_process_start_time(target_pid)
-        record = {
-            "target_pid": target_pid,
-            "target_start_time": target_start_time,
-            "replacer_pid": os.getpid(),
-            "written_at": _utc_now_iso(),
-        }
-        _write_json_file(_get_takeover_marker_path(), record)
-        return True
-    except (OSError, PermissionError):
-        return False
-
-
-def consume_takeover_marker_for_self() -> bool:
-    """Check & unlink the takeover marker if it names the current process.
-
-    Returns True only when a valid (non-stale) marker names this PID +
-    start_time. A returning True indicates the current SIGTERM is a
-    planned --replace takeover; the caller should exit 0 instead of
-    signalling ``_signal_initiated_shutdown``.
-
-    Always unlinks the marker on match (and on detected staleness) so
-    subsequent unrelated signals don't re-trigger.
-    """
-    return _consume_pid_marker_for_self(
-        _get_takeover_marker_path(),
-        pid_field="target_pid",
-        start_time_field="target_start_time",
-        ttl_s=_TAKEOVER_MARKER_TTL_S,
-    )
-
-
 def clear_takeover_marker() -> None:
-    """Remove the takeover marker unconditionally. Safe to call repeatedly."""
     try:
         _get_takeover_marker_path().unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def write_planned_stop_marker(target_pid: int) -> bool:
-    """Record that ``target_pid`` is being stopped intentionally.
-
-    The gateway exits non-zero for unexpected SIGTERM so service managers can
-    revive it. Service stop commands send the same SIGTERM, so the CLI writes
-    this short-lived marker first to let the target process exit cleanly.
-    """
+def _is_pid_alive_windows(pid: int) -> bool:
+    """Check if a PID is alive on Windows using tasklist."""
     try:
-        target_start_time = _get_process_start_time(target_pid)
-        record = {
-            "target_pid": target_pid,
-            "target_start_time": target_start_time,
-            "stopper_pid": os.getpid(),
-            "written_at": _utc_now_iso(),
-        }
-        _write_json_file(_get_planned_stop_marker_path(), record)
-        return True
-    except (OSError, PermissionError):
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return str(pid) in result.stdout
+    except Exception:
         return False
-
-
-def consume_planned_stop_marker_for_self() -> bool:
-    """Return True when the current process is being intentionally stopped."""
-    return _consume_pid_marker_for_self(
-        _get_planned_stop_marker_path(),
-        pid_field="target_pid",
-        start_time_field="target_start_time",
-        ttl_s=_PLANNED_STOP_MARKER_TTL_S,
-    )
-
-
-def clear_planned_stop_marker() -> None:
-    """Remove the planned-stop marker unconditionally."""
-    try:
-        _get_planned_stop_marker_path().unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def get_running_pid(
@@ -934,6 +763,8 @@ def get_running_pid(
     """
     resolved_pid_path = pid_path or _get_pid_path()
     resolved_lock_path = _get_gateway_lock_path(resolved_pid_path)
+    
+    # Check lock first. If the lock is held, the process is alive.
     lock_active = is_gateway_runtime_lock_active(resolved_lock_path)
     if not lock_active:
         _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
@@ -947,7 +778,27 @@ def get_running_pid(
         if pid is None:
             continue
 
-        if not _pid_exists(pid):
+        is_alive = False
+        try:
+            os.kill(pid, 0)
+            is_alive = True
+        except ProcessLookupError:
+            is_alive = False
+        except OSError as e:
+            if platform_info.is_windows:
+                we = getattr(e, "winerror", 0)
+                if we == 87:
+                    is_alive = False
+                elif we == 5:
+                    is_alive = True
+                else:
+                    is_alive = _is_pid_alive_windows(pid)
+            else:
+                is_alive = False
+        except PermissionError:
+            is_alive = True
+
+        if not is_alive:
             continue
 
         recorded_start = record.get("start_time")
@@ -958,7 +809,8 @@ def get_running_pid(
         if _looks_like_gateway_process(pid) or _record_looks_like_gateway(record):
             return pid
 
-    _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
+    # If the lock is active but we couldn't validate the records (e.g. read failure),
+    # do NOT clean up. Returning None here is safer than unlinking a live PID file.
     return None
 
 
