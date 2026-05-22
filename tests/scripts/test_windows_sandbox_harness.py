@@ -21,6 +21,9 @@ def test_windows_sandbox_smoke_uses_skip_setup_and_skip_gateway():
     assert "hermes gateway status" in source
     assert "HERMES_GIT_BASH_PATH" in source
     assert "Start-Transcript" in source
+    assert "Save-Summary" in source
+    assert "InstallerTimeoutMinutes" in source
+    assert "last_heartbeat" in source
 
 
 def test_windows_sandbox_smoke_does_not_delete_host_checkout():

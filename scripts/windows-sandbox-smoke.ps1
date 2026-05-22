@@ -15,7 +15,8 @@ param(
     [string]$RepoRoot = "C:\Users\WDAGUtilityAccount\Desktop\HermesAgent",
     [string]$OutputDir = "C:\Users\WDAGUtilityAccount\Desktop\hermes-sandbox-results",
     [string]$Branch = "main",
-    [switch]$RemoteClone
+    [switch]$RemoteClone,
+    [int]$InstallerTimeoutMinutes = 45
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +44,11 @@ function Invoke-Checked {
     }
 }
 
+function Save-Summary {
+    $result.last_heartbeat = (Get-Date).ToString("o")
+    $result | ConvertTo-Json -Depth 5 | Set-Content -Path $summaryPath -Encoding UTF8
+}
+
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logPath = Join-Path $OutputDir "sandbox-smoke-$timestamp.log"
@@ -58,11 +64,18 @@ $result = [ordered]@{
     install_root = $null
     hermes_version = $null
     gateway_status_exit_code = $null
+    current_step = "starting"
+    installer_pid = $null
+    installer_exit_code = $null
+    last_heartbeat = $null
     error = $null
 }
 
+Save-Summary
 Start-Transcript -Path $logPath -Force | Out-Null
 try {
+    $result.current_step = "prepare-install-root"
+    Save-Summary
     Write-Step "Preparing sandbox install root"
     $installRoot = Join-Path $env:LOCALAPPDATA "hermes\hermes-agent"
     $result.install_root = $installRoot
@@ -70,6 +83,8 @@ try {
     Remove-Item (Join-Path $env:USERPROFILE ".hermes") -Recurse -Force -ErrorAction SilentlyContinue
 
     if (-not $RemoteClone) {
+        $result.current_step = "copy-checkout"
+        Save-Summary
         Assert-PathExists (Join-Path $RepoRoot "scripts\install.ps1") "Mapped installer"
         Write-Step "Copying mapped checkout to writable install root"
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installRoot) | Out-Null
@@ -86,6 +101,8 @@ try {
     }
 
     try {
+        $result.current_step = "run-installer"
+        Save-Summary
         Write-Step "Running installer"
         $installerStdout = Join-Path $OutputDir "sandbox-installer-$timestamp.stdout.log"
         $installerStderr = Join-Path $OutputDir "sandbox-installer-$timestamp.stderr.log"
@@ -101,11 +118,24 @@ try {
         )
         $installerProcess = Start-Process -FilePath "powershell.exe" `
             -ArgumentList $installerArgs `
-            -Wait `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput $installerStdout `
             -RedirectStandardError $installerStderr
+        $result.installer_pid = $installerProcess.Id
+        Save-Summary
+        $deadline = (Get-Date).AddMinutes($InstallerTimeoutMinutes)
+        while (-not $installerProcess.WaitForExit(10000)) {
+            if ((Get-Date) -gt $deadline) {
+                try {
+                    Stop-Process -Id $installerProcess.Id -Force -ErrorAction SilentlyContinue
+                } catch {}
+                throw "install.ps1 timed out after $InstallerTimeoutMinutes minutes; see $installerStdout and $installerStderr"
+            }
+            Save-Summary
+        }
+        $result.installer_exit_code = $installerProcess.ExitCode
+        Save-Summary
         if (Test-Path $installerStdout) {
             Get-Content -Path $installerStdout | Out-Host
         }
@@ -119,11 +149,15 @@ try {
         Pop-Location
     }
 
+    $result.current_step = "validate-files"
+    Save-Summary
     Write-Step "Validating installed files"
     $shim = Join-Path $env:LOCALAPPDATA "hermes\bin\hermes.cmd"
     Assert-PathExists $shim "Hermes shim"
     Assert-PathExists (Join-Path $installRoot ".venv\Scripts\python.exe") "Hermes venv python"
 
+    $result.current_step = "validate-hermes-version"
+    Save-Summary
     Write-Step "Validating hermes command"
     $env:Path = "$(Split-Path -Parent $shim);$env:Path"
     $versionOutput = & $shim --version 2>&1
@@ -133,6 +167,8 @@ try {
     $result.hermes_version = ($versionOutput -join "`n").Trim()
     Write-Host $result.hermes_version
 
+    $result.current_step = "validate-gateway-status"
+    Save-Summary
     Write-Step "Validating gateway status does not crash"
     & $shim gateway status
     $result.gateway_status_exit_code = $LASTEXITCODE
@@ -140,6 +176,8 @@ try {
         throw "hermes gateway status failed with exit code $LASTEXITCODE"
     }
 
+    $result.current_step = "validate-native-bash"
+    Save-Summary
     Write-Step "Validating native terminal path"
     $bashPath = [Environment]::GetEnvironmentVariable("HERMES_GIT_BASH_PATH", "User")
     if (-not $bashPath) {
@@ -149,6 +187,7 @@ try {
     Invoke-Checked $bashPath --version
 
     $result.ok = $true
+    $result.current_step = "complete"
 } catch {
     $result.error = $_.Exception.Message
     Write-Host ""
@@ -156,7 +195,7 @@ try {
     throw
 } finally {
     $result.finished_at = (Get-Date).ToString("o")
-    $result | ConvertTo-Json -Depth 5 | Set-Content -Path $summaryPath -Encoding UTF8
+    Save-Summary
     Stop-Transcript | Out-Null
     Write-Host ""
     Write-Host "Log: $logPath"
