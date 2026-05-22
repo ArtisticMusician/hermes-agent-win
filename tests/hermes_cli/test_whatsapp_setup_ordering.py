@@ -138,3 +138,55 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     # The skip-rebar branch should have set the env var on its way out.
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+
+
+def test_pairing_uses_resolved_node_command(isolated_home, monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+
+    inputs = iter(["15551234567"])
+
+    def fake_input(_prompt=""):
+        try:
+            return next(inputs)
+        except StopIteration:
+            return ""
+
+    node_calls = []
+    run_calls = []
+
+    def fake_resolve(name, argv):
+        node_calls.append((name, argv))
+        return ["C:/Node/node.exe", *argv]
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append((cmd, kwargs))
+        if "--pair-only" in cmd:
+            session = Path(cmd[cmd.index("--session") + 1])
+            session.mkdir(parents=True, exist_ok=True)
+            (session / "creds.json").write_text("{}", encoding="utf-8")
+        return MagicMock(returncode=0, stderr="")
+
+    _orig_exists = Path.exists
+
+    def _stub_exists(self):
+        if self.name == "node_modules":
+            return True
+        return _orig_exists(self)
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    monkeypatch.setattr(main_mod, "resolve_node_command", fake_resolve)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(Path, "exists", _stub_exists)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        main_mod.cmd_whatsapp(MagicMock())
+
+    assert node_calls
+    assert node_calls[0][0] == "node"
+    pair_cmd = next(cmd for cmd, _ in run_calls if "--pair-only" in cmd)
+    assert pair_cmd[0] == "C:/Node/node.exe"
+    assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"

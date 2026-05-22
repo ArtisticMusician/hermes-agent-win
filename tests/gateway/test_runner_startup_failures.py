@@ -1,4 +1,4 @@
-import pytest
+import asyncio
 from unittest.mock import AsyncMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -63,8 +63,7 @@ class _SuccessfulAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
-@pytest.mark.asyncio
-async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_path):
+def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_path):
     """Retryable startup errors should leave the gateway running in
     degraded mode so the reconnect watcher can recover the platform when
     the underlying problem clears.  Previously this returned False from
@@ -83,7 +82,7 @@ async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_
 
     monkeypatch.setattr(runner, "_create_adapter", lambda platform, platform_config: _RetryableFailureAdapter())
 
-    ok = await runner.start()
+    ok = asyncio.run(runner.start())
 
     # Gateway stays alive in degraded mode; reconnect watcher takes over.
     assert ok is True
@@ -96,8 +95,7 @@ async def test_runner_stays_alive_for_retryable_startup_errors(monkeypatch, tmp_
     assert state["platforms"]["telegram"]["error_code"] == "telegram_connect_error"
 
 
-@pytest.mark.asyncio
-async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkeypatch, tmp_path):
+def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = GatewayConfig(
         platforms={
@@ -107,7 +105,7 @@ async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkey
     )
     runner = GatewayRunner(config)
 
-    ok = await runner.start()
+    ok = asyncio.run(runner.start())
 
     assert ok is True
     assert runner.should_exit_cleanly is False
@@ -116,8 +114,7 @@ async def test_runner_allows_cron_only_mode_when_no_platforms_are_enabled(monkey
     assert state["gateway_state"] == "running"
 
 
-@pytest.mark.asyncio
-async def test_runner_records_connected_platform_state_on_success(monkeypatch, tmp_path):
+def test_runner_records_connected_platform_state_on_success(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config = GatewayConfig(
         platforms={
@@ -131,7 +128,7 @@ async def test_runner_records_connected_platform_state_on_success(monkeypatch, t
     monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
     monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
 
-    ok = await runner.start()
+    ok = asyncio.run(runner.start())
 
     assert ok is True
     state = read_runtime_status()
@@ -141,8 +138,7 @@ async def test_runner_records_connected_platform_state_on_success(monkeypatch, t
     assert state["platforms"]["discord"]["error_message"] is None
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, tmp_path):
+def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, tmp_path):
     """Verbosity != None must not crash with NameError on RedactingFormatter (#8044)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -169,13 +165,12 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
 
     # verbosity=1 triggers the code path that uses RedactingFormatter.
     # Before the fix this raised NameError.
-    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
+    ok = asyncio.run(start_gateway(config=GatewayConfig(), replace=False, verbosity=1))
 
     assert ok is True
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_path):
+def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     calls = []
@@ -206,9 +201,9 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
         "gateway.status.release_all_scoped_locks",
         lambda **kwargs: 0,
     )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
     monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, force=False: calls.append((pid, force)))
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
-    monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)
     monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
@@ -217,14 +212,13 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
 
     from gateway.run import start_gateway
 
-    ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
+    ok = asyncio.run(start_gateway(config=GatewayConfig(), replace=True, verbosity=None))
 
     assert ok is True
     assert calls == [(42, False), (42, True)]
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
+def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     monkeypatch, tmp_path
 ):
     """--replace must write a takeover marker BEFORE sending SIGTERM.
@@ -299,7 +293,7 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
 
     from gateway.run import start_gateway
 
-    ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
+    ok = asyncio.run(start_gateway(config=GatewayConfig(), replace=True, verbosity=None))
 
     assert ok is True
     # Ordering: marker written BEFORE SIGTERM
@@ -309,8 +303,7 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     assert not (tmp_path / ".gateway-takeover.json").exists()
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_replace_clears_marker_on_permission_denied(
+def test_start_gateway_replace_clears_marker_on_permission_denied(
     monkeypatch, tmp_path
 ):
     """If we fail to kill the existing PID (permission denied), clean up the
@@ -341,15 +334,14 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
     from gateway.run import start_gateway
 
     # Should return False due to permission error
-    ok = await start_gateway(config=GatewayConfig(), replace=True, verbosity=None)
+    ok = asyncio.run(start_gateway(config=GatewayConfig(), replace=True, verbosity=None))
 
     assert ok is False
     # Marker must NOT be left behind
     assert not (tmp_path / ".gateway-takeover.json").exists()
 
 
-@pytest.mark.asyncio
-async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch, tmp_path, caplog):
+def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch, tmp_path, caplog):
     """When all enabled platforms have no adapter (missing library or credentials),
     the gateway should NOT return failure — it should warn and continue running for
     cron job execution, matching the behaviour of 'no platforms enabled' (#5196).
@@ -373,7 +365,7 @@ async def test_runner_degrades_gracefully_when_all_adapters_missing(monkeypatch,
 
     import logging
     with caplog.at_level(logging.WARNING):
-        ok = await runner.start()
+        ok = asyncio.run(runner.start())
 
     # Must NOT return False — gateway should keep running for cron.
     assert ok is True

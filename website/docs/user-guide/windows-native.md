@@ -43,6 +43,32 @@ No admin rights required. The installer goes to `%LOCALAPPDATA%\hermes\` and add
 | `-HermesHome` | `%LOCALAPPDATA%\hermes` | Override data directory |
 | `-InstallDir` | `%LOCALAPPDATA%\hermes\hermes-agent` | Override code location |
 
+## Clean Windows Sandbox validation
+
+For release or PR validation, use Windows Sandbox to exercise a first-install
+machine instead of relying on a developer workstation that already has Python,
+Git, Node, caches, and Hermes state.
+
+From the repo root on the Windows host:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-sandbox-validate.ps1
+```
+
+The launcher generates `sandbox-results\hermes-installer-validation.wsb`,
+maps the checkout into Sandbox read-only, maps `sandbox-results\` back to the
+host as writable output, and starts `scripts\windows-sandbox-smoke.ps1` inside
+the sandbox. The smoke script copies the checkout to the sandbox user's
+`%LOCALAPPDATA%\hermes\hermes-agent`, runs `install.ps1 -SkipSetup -SkipGateway`,
+then verifies:
+
+- `hermes --version`
+- `hermes gateway status`
+- `HERMES_GIT_BASH_PATH` points at a real native `bash.exe`
+
+Use `-NoLaunch` to generate the `.wsb` without opening Sandbox, and
+`-RemoteClone` to test the installer clone path instead of the mapped checkout.
+
 ## What the installer actually does
 
 Top-to-bottom, in order:
@@ -84,12 +110,12 @@ Hermes's terminal tool runs commands through **Git Bash**, same strategy Claude 
 Resolution order for `bash.exe`:
 
 1. `HERMES_GIT_BASH_PATH` environment variable if set.
-2. `%LOCALAPPDATA%\hermes\git\usr\bin\bash.exe` (installer-managed PortableGit).
-3. `%LOCALAPPDATA%\hermes\git\bin\bash.exe` (older Git-for-Windows layout).
+2. `%LOCALAPPDATA%\hermes\git\bin\bash.exe` (installer-managed PortableGit).
+3. `%LOCALAPPDATA%\hermes\git\usr\bin\bash.exe` (legacy MinGit-style fallback).
 4. System Git-for-Windows install (`%ProgramFiles%\Git\bin\bash.exe`, etc.).
 5. MSYS2, Cygwin, or any `bash.exe` on PATH as a last resort.
 
-The installer sets `HERMES_GIT_BASH_PATH` explicitly so fresh PowerShell sessions don't have to re-discover. Override it if you want Hermes to use a specific bash — for example, your system Git Bash or a WSL-hosted bash via a symlink.
+The installer sets `HERMES_GIT_BASH_PATH` explicitly so fresh PowerShell sessions don't have to re-discover. Override it if you want Hermes to use a specific **native Windows** bash, such as your system Git Bash. Do not point it at `C:\Windows\System32\bash.exe` or a WSL launcher; Hermes rejects that path because it breaks native Windows cwd, process, and path handling.
 
 **Pitfall:** MinGit's layout is different from the full Git-for-Windows installer — bash lives under `usr\bin\bash.exe`, not `bin\bash.exe`. Hermes checks both. If you're manually unpacking a MinGit zip, make sure you pick the **non-busybox** variant (`MinGit-*-64-bit.zip`, not `MinGit-*-busybox*.zip`) — busybox builds ship `ash` instead of `bash` and most coreutils are missing.
 
@@ -226,7 +252,7 @@ These only affect native Windows installs:
 
 | Variable | Effect |
 |---|---|
-| `HERMES_GIT_BASH_PATH` | Override bash.exe discovery. Point at any bash — full Git-for-Windows, WSL bash via symlink, MSYS2, Cygwin. The installer sets this automatically. |
+| `HERMES_GIT_BASH_PATH` | Override bash.exe discovery. Point at a native Windows bash — full Git-for-Windows, PortableGit, MSYS2, or Cygwin. Do not point it at WSL's `bash.exe`; Hermes rejects the WSL launcher on native Windows. The installer sets this automatically. |
 | `HERMES_DISABLE_WINDOWS_UTF8` | Set to `1` to disable the UTF-8 stdio shim and fall back to the locale code page. Useful for bisecting an encoding bug. |
 | `EDITOR` / `VISUAL` | Your editor for `/edit` and `Ctrl-X Ctrl-E`. Hermes defaults to `notepad` if both are unset. |
 

@@ -70,6 +70,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli._subprocess_compat import resolve_node_command
+
 
 def _add_accept_hooks_flag(parser) -> None:
     """Attach the ``--accept-hooks`` flag.  Shared across every agent
@@ -1701,7 +1703,10 @@ def cmd_whatsapp(args):
 
     try:
         subprocess.run(
-            ["node", str(bridge_script), "--pair-only", "--session", str(session_dir)],
+            resolve_node_command(
+                "node",
+                [str(bridge_script), "--pair-only", "--session", str(session_dir)],
+            ),
             cwd=str(bridge_dir),
         )
     except KeyboardInterrupt:
@@ -6570,6 +6575,34 @@ def _update_via_zip(args):
     _kill_stale_dashboard_processes()
 
 
+def _looks_like_windows_access_denied(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "access is denied",
+            "access denied",
+            "permission denied",
+            "winerror 5",
+            "unable to unlink",
+            "unable to create file",
+        )
+    )
+
+
+def _print_windows_update_access_denied_hint(detail: str = "") -> None:
+    if sys.platform != "win32":
+        return
+    if detail and not _looks_like_windows_access_denied(detail):
+        return
+
+    print()
+    print("Windows file-lock hint:")
+    print("  Close other Hermes terminals, dashboards, editors, and antivirus quarantine prompts, then retry:")
+    print("    hermes update")
+    print("  If it still fails, restart Windows and run the update from a fresh PowerShell window.")
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
@@ -8025,6 +8058,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(f"✗ Failed to fetch updates from origin.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
+            _print_windows_update_access_denied_hint(stderr)
             sys.exit(1)
 
         # Get current branch (returns literal "HEAD" when detached)
@@ -8140,8 +8174,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 if reset_result.returncode != 0:
                     print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                    reset_stderr = reset_result.stderr.strip()
+                    if reset_stderr:
+                        print(f"  {reset_stderr}")
+                    _print_windows_update_access_denied_hint(reset_stderr)
                     print(
                         "  Try manually: git fetch origin && git reset --hard origin/main"
                     )
@@ -9015,6 +9051,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
             print(f"⚠ Git update failed: {e}")
+            detail = "\n".join(
+                part
+                for part in (
+                    getattr(e, "stderr", "") or "",
+                    getattr(e, "stdout", "") or "",
+                    str(e),
+                )
+                if part
+            )
+            _print_windows_update_access_denied_hint(detail)
             print("→ Falling back to ZIP download...")
             print()
             _update_via_zip(args)

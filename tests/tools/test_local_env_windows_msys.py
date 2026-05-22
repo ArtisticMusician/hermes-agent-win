@@ -19,6 +19,7 @@ on the real OS.
 """
 
 import os
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -64,8 +65,16 @@ class TestMsysToWindowsPath:
         just because they start with ``/`` and a single letter — the regex
         only matches when the first segment is exactly one character."""
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
-        assert _msys_to_windows_path("/tmp/foo") == "/tmp/foo"
+        assert _msys_to_windows_path("/tmp/foo") == str(
+            os.path.join(tempfile.gettempdir(), "foo")
+        )
         assert _msys_to_windows_path("/home/x") == "/home/x"
+
+    def test_translates_git_bash_tmp_to_native_temp(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _msys_to_windows_path("/tmp/hermes") == str(
+            os.path.join(tempfile.gettempdir(), "hermes")
+        )
 
     def test_empty_string(self, monkeypatch):
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)

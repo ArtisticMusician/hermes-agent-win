@@ -14,7 +14,7 @@ class DaemonManager:
         """
         Spawns a background process disconnected from the terminal.
         """
-        with open(log_path, 'a') as log_file:
+        with open(log_path, 'a', encoding='utf-8') as log_file:
             if platform_info.is_windows:
                 # Use creationflags for DETACHED_PROCESS so it survives parent exit.
                 DETACHED_PROCESS = 0x00000008

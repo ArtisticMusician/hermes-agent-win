@@ -67,6 +67,36 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    MSGRAPH_WEBHOOK = "msgraph_webhook"
+    YUANBAO = "yuanbao"
+    GOOGLE_CHAT = "google_chat"
+
+    @classmethod
+    def _missing_(cls, value):
+        if not isinstance(value, str):
+            raise ValueError(f"{value!r} is not a valid {cls.__name__}")
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError(f"{value!r} is not a valid {cls.__name__}")
+
+        try:
+            from gateway.platform_registry import platform_registry
+
+            registered = platform_registry.is_registered(normalized)
+        except Exception:
+            registered = False
+
+        plugin_dir = Path(__file__).resolve().parent.parent / "plugins" / "platforms" / normalized
+        if not registered and not plugin_dir.exists():
+            raise ValueError(f"{value!r} is not a valid {cls.__name__}")
+
+        member_name = normalized.replace("-", "_").upper()
+        pseudo_member = object.__new__(cls)
+        pseudo_member._name_ = member_name
+        pseudo_member._value_ = normalized
+        cls._value2member_map_[normalized] = pseudo_member
+        cls._member_map_[member_name] = pseudo_member
+        return pseudo_member
 
 
 @dataclass
@@ -271,59 +301,26 @@ class GatewayConfig:
         for platform, config in self.platforms.items():
             if not config.enabled:
                 continue
-            # Weixin requires both a token and an account_id
-            if platform == Platform.WEIXIN:
-                if config.extra.get("account_id") and (config.token or config.extra.get("token")):
-                    connected.append(platform)
-                continue
             # Platforms that use token/api_key auth
             if config.token or config.api_key:
                 connected.append(platform)
-            # WhatsApp uses enabled flag only (bridge handles auth)
-            elif platform == Platform.WHATSAPP:
-                connected.append(platform)
-            # Signal uses extra dict for config (http_url + account)
-            elif platform == Platform.SIGNAL and config.extra.get("http_url"):
-                connected.append(platform)
-            # Email uses extra dict for config (address + imap_host + smtp_host)
-            elif platform == Platform.EMAIL and config.extra.get("address"):
-                connected.append(platform)
-            # SMS uses api_key (Twilio auth token) — SID checked via env
-            elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
-                connected.append(platform)
-            # API Server uses enabled flag only (no token needed)
-            elif platform == Platform.API_SERVER:
-                connected.append(platform)
-            # Webhook uses enabled flag only (secrets are per-route)
-            elif platform == Platform.WEBHOOK:
-                connected.append(platform)
-            # Feishu uses extra dict for app credentials
-            elif platform == Platform.FEISHU and config.extra.get("app_id"):
-                connected.append(platform)
-            # WeCom bot mode uses extra dict for bot credentials
-            elif platform == Platform.WECOM and config.extra.get("bot_id"):
-                connected.append(platform)
-            # WeCom callback mode uses corp_id or apps list
-            elif platform == Platform.WECOM_CALLBACK and (
-                config.extra.get("corp_id") or config.extra.get("apps")
-            ):
-                connected.append(platform)
-            # BlueBubbles uses extra dict for local server config
-            elif platform == Platform.BLUEBUBBLES and config.extra.get("server_url") and config.extra.get("password"):
-                connected.append(platform)
-            # QQBot uses extra dict for app credentials
-            elif platform == Platform.QQBOT and config.extra.get("app_id") and config.extra.get("client_secret"):
-                connected.append(platform)
-            # DingTalk uses client_id/client_secret from config.extra or env vars
-            elif platform == Platform.DINGTALK and (
-                config.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID")
-            ) and (
-                config.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET")
-            ):
-                connected.append(platform)
-        
+            elif checker := _PLATFORM_CONNECTED_CHECKERS.get(platform):
+                if checker(config):
+                    connected.append(platform)
+            else:
+                try:
+                    from gateway.platform_registry import platform_registry
+
+                    entry = platform_registry.get(platform.value)
+                    if entry and entry.is_connected and entry.is_connected(config):
+                        connected.append(platform)
+                    elif entry and entry.validate_config and entry.validate_config(config):
+                        connected.append(platform)
+                except Exception:
+                    pass
+
         return connected
-    
+
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         """Get the home channel for a platform."""
         config = self.platforms.get(platform)
@@ -454,6 +451,59 @@ class GatewayConfig:
                     self.unauthorized_dm_behavior,
                 )
         return self.unauthorized_dm_behavior
+
+
+_BUILTIN_PLATFORM_VALUES = tuple(member.value for member in Platform)
+
+
+def _enabled_only(config: PlatformConfig) -> bool:
+    return bool(config.enabled)
+
+
+def _has_extra(*keys: str):
+    return lambda config: all(config.extra.get(key) for key in keys)
+
+
+def _dingtalk_connected(config: PlatformConfig) -> bool:
+    return bool(
+        (config.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
+        and (config.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
+    )
+
+
+def _weixin_connected(config: PlatformConfig) -> bool:
+    return bool(config.extra.get("account_id") and (config.token or config.extra.get("token")))
+
+
+def _sms_connected(config: PlatformConfig) -> bool:
+    return bool(os.getenv("TWILIO_ACCOUNT_SID"))
+
+
+def _yuanbao_connected(config: PlatformConfig) -> bool:
+    return bool(
+        (config.extra.get("app_id") or os.getenv("YUANBAO_APP_ID"))
+        and (config.extra.get("app_secret") or os.getenv("YUANBAO_APP_SECRET"))
+    )
+
+
+_PLATFORM_CONNECTED_CHECKERS = {
+    Platform.WHATSAPP: _enabled_only,
+    Platform.SIGNAL: _has_extra("http_url"),
+    Platform.EMAIL: _has_extra("address"),
+    Platform.SMS: _sms_connected,
+    Platform.API_SERVER: _enabled_only,
+    Platform.WEBHOOK: _enabled_only,
+    Platform.MSGRAPH_WEBHOOK: _enabled_only,
+    Platform.FEISHU: _has_extra("app_id"),
+    Platform.WECOM: _has_extra("bot_id"),
+    Platform.WECOM_CALLBACK: lambda config: bool(config.extra.get("corp_id") or config.extra.get("apps")),
+    Platform.WEIXIN: _weixin_connected,
+    Platform.BLUEBUBBLES: _has_extra("server_url", "password"),
+    Platform.QQBOT: _has_extra("app_id", "client_secret"),
+    Platform.YUANBAO: _yuanbao_connected,
+    Platform.DINGTALK: _dingtalk_connected,
+    Platform.GOOGLE_CHAT: _enabled_only,
+}
 
 
 def load_gateway_config() -> GatewayConfig:
@@ -603,6 +653,62 @@ def load_gateway_config() -> GatewayConfig:
                     extra = {}
                     plat_data["extra"] = extra
                 extra.update(bridged)
+
+            try:
+                from gateway.platform_registry import platform_registry
+
+                registry_entries = platform_registry.all_entries()
+            except Exception:
+                registry_entries = []
+            builtin_names = {plat.value for plat in Platform if plat != Platform.LOCAL}
+            plugin_names = {entry.name for entry in registry_entries}
+            shared_keys = (
+                "unauthorized_dm_behavior",
+                "reply_prefix",
+                "require_mention",
+                "free_response_channels",
+                "mention_patterns",
+                "dm_policy",
+                "allow_from",
+                "group_policy",
+                "group_allow_from",
+                "channel_prompts",
+            )
+            for platform_name in sorted((builtin_names | plugin_names) - {"local"}):
+                platform_cfg = yaml_cfg.get(platform_name)
+                if not isinstance(platform_cfg, dict):
+                    continue
+                plat_data = platforms_data.setdefault(platform_name, {})
+                if not isinstance(plat_data, dict):
+                    plat_data = {}
+                    platforms_data[platform_name] = plat_data
+                extra = plat_data.setdefault("extra", {})
+                if not isinstance(extra, dict):
+                    extra = {}
+                    plat_data["extra"] = extra
+                for key in shared_keys:
+                    if key in platform_cfg:
+                        value = platform_cfg[key]
+                        if key == "unauthorized_dm_behavior":
+                            value = _normalize_unauthorized_dm_behavior(
+                                value,
+                                gw_data.get("unauthorized_dm_behavior", "pair"),
+                            )
+                        if key == "channel_prompts" and isinstance(value, dict):
+                            value = {str(k): v for k, v in value.items()}
+                        extra[key] = value
+                entry = next((item for item in registry_entries if item.name == platform_name), None)
+                hook = getattr(entry, "apply_yaml_config_fn", None) if entry else None
+                if hook:
+                    try:
+                        hook_extra = hook(yaml_cfg, platform_cfg)
+                    except Exception:
+                        logger.debug("Platform %s config hook failed", platform_name, exc_info=True)
+                    else:
+                        if isinstance(hook_extra, dict):
+                            extra.update(hook_extra)
+                if extra or plat_data.get("enabled") is not None:
+                    platforms_data[platform_name] = plat_data
 
             # Slack settings → env vars (env vars take precedence)
             slack_cfg = yaml_cfg.get("slack", {})

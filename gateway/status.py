@@ -22,15 +22,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
+from utils import atomic_json_write
 
 if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
 
+_IS_WINDOWS = sys.platform == "win32"
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
 _LOCKS_DIRNAME = "gateway-locks"
+_WINDOWS_LOCK_OFFSET = 0x7FFF0000
 
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
@@ -75,7 +78,7 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
     POSIX uses SIGTERM/SIGKILL. Windows uses taskkill /T /F for true force-kill
     because os.kill(..., SIGTERM) is not equivalent to a tree-killing hard stop.
     """
-    if force and platform_info.is_windows:
+    if force and _IS_WINDOWS:
         try:
             result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -94,6 +97,35 @@ def terminate_pid(pid: int, *, force: bool = False) -> None:
 
     sig = signal.SIGTERM if not force else getattr(signal, "SIGKILL", signal.SIGTERM)
     os.kill(pid, sig)
+
+
+def _pid_exists(pid: int) -> bool:
+    """Return True when a PID exists, preserving permission-denied semantics."""
+    if not pid:
+        return False
+
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — psutil-first POSIX fallback
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as e:
+        if _IS_WINDOWS:
+            winerror = getattr(e, "winerror", None)
+            if winerror == 5:
+                return True
+            if winerror == 87:
+                return False
+        return False
 
 
 def _scope_hash(identity: str) -> str:
@@ -139,6 +171,14 @@ def get_process_start_time(pid: int) -> Optional[int]:
 
 def _read_process_cmdline(pid: int) -> Optional[str]:
     """Return the process command line as a space-separated string."""
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = cmdline_path.read_bytes()
+        if raw:
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+
     if platform_info.is_windows:
         try:
             result = subprocess.run(
@@ -151,19 +191,26 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
                 for line in result.stdout.splitlines():
                     if line.startswith("CommandLine="):
                         return line.split("=", 1)[1].strip()
+                stripped = result.stdout.strip()
+                if stripped:
+                    return stripped
         except Exception:
             pass
         return None
 
-    cmdline_path = Path(f"/proc/{pid}/cmdline")
     try:
-        raw = cmdline_path.read_bytes()
-    except (FileNotFoundError, PermissionError, OSError):
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            stripped = result.stdout.strip()
+            return stripped or None
+    except Exception:
         return None
-
-    if not raw:
-        return None
-    return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+    return None
 
 
 def _looks_like_gateway_process(pid: int) -> bool:
@@ -245,8 +292,7 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
@@ -318,11 +364,12 @@ def _write_gateway_lock_record(handle) -> None:
 def _try_acquire_file_lock(handle) -> bool:
     try:
         if platform_info.is_windows:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
+            if handle.seek(0, os.SEEK_END) == 0:
                 handle.write("\n")
                 handle.flush()
-            handle.seek(0)
+            # msvcrt locks bytes relative to the current file position. Use a
+            # high offset so the lock byte never overlaps the JSON payload.
+            handle.seek(_WINDOWS_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -334,7 +381,7 @@ def _try_acquire_file_lock(handle) -> bool:
 def _release_file_lock(handle) -> None:
     try:
         if platform_info.is_windows:
-            handle.seek(0)
+            handle.seek(_WINDOWS_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -449,6 +496,7 @@ def write_runtime_status(
     payload.setdefault("kind", _GATEWAY_KIND)
     payload["pid"] = os.getpid()
     payload["start_time"] = _get_process_start_time(os.getpid())
+    payload["argv"] = list(sys.argv)
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:
@@ -503,6 +551,65 @@ def remove_pid_file() -> None:
         pass
 
 
+def _posix_pid_is_stopped(pid: int) -> bool:
+    """Return True when /proc reports a stopped/traced process."""
+    if platform_info.is_windows:
+        return False
+    try:
+        proc_status = Path(f"/proc/{pid}/status")
+        if not proc_status.exists():
+            return False
+        for line in proc_status.read_text().splitlines():
+            if line.startswith("State:"):
+                state = line.split()[1]
+                return state in ("T", "t")
+    except (OSError, PermissionError, IndexError):
+        return False
+    return False
+
+
+def _scoped_lock_record_is_stale(existing: dict[str, Any], current_record: dict[str, Any]) -> bool:
+    """Return True when an existing scoped lock no longer represents a live owner."""
+    try:
+        existing_pid = int(existing["pid"])
+    except (KeyError, TypeError, ValueError):
+        return True
+
+    if (
+        existing_pid == os.getpid()
+        and existing.get("start_time") == current_record.get("start_time")
+    ):
+        return False
+
+    if not _pid_exists(existing_pid):
+        return True
+
+    current_start = _get_process_start_time(existing_pid)
+    recorded_start = existing.get("start_time")
+    if (
+        recorded_start is not None
+        and current_start is not None
+    ):
+        return current_start != recorded_start
+
+    if _posix_pid_is_stopped(existing_pid):
+        return True
+
+    if _looks_like_gateway_process(existing_pid):
+        return False
+
+    cmdline = _read_process_cmdline(existing_pid)
+    if cmdline:
+        # The PID is alive but belongs to another program. Treat the old lock
+        # as stale even if its persisted argv once looked like Hermes.
+        return True
+
+    # If the platform cannot read command lines, fall back to the lock's own
+    # metadata. This is common on stripped Windows hosts where wmic/ps is not
+    # available; deleting a live gateway lock there causes duplicate adapters.
+    return not _record_looks_like_gateway(existing)
+
+
 def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, Any]] = None) -> tuple[bool, Optional[dict[str, Any]]]:
     """Acquire a machine-local lock keyed by scope + identity.
 
@@ -530,45 +637,21 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         except OSError:
             pass
     if existing:
+        same_owner = False
         try:
             existing_pid = int(existing["pid"])
+            same_owner = (
+                existing_pid == os.getpid()
+                and existing.get("start_time") == record.get("start_time")
+            )
         except (KeyError, TypeError, ValueError):
-            existing_pid = None
+            pass
 
-        if existing_pid == os.getpid() and existing.get("start_time") == record.get("start_time"):
+        if same_owner:
             _write_json_file(lock_path, record)
             return True, existing
 
-        stale = existing_pid is None
-        if not stale:
-            try:
-                os.kill(existing_pid, 0)
-            except (ProcessLookupError, PermissionError, OSError):
-                # Windows raises OSError with WinError 87 for invalid pid check
-                stale = True
-            else:
-                current_start = _get_process_start_time(existing_pid)
-                if (
-                    existing.get("start_time") is not None
-                    and current_start is not None
-                    and current_start != existing.get("start_time")
-                ):
-                    stale = True
-                # Check if process is stopped (Ctrl+Z / SIGTSTP) - stopped
-                # processes still respond to os.kill(pid, 0) but are not
-                # actually running. Treat them as stale so --replace works.
-                if not stale and not platform_info.is_windows:
-                    try:
-                        _proc_status = Path(f"/proc/{existing_pid}/status")
-                        if _proc_status.exists():
-                            for _line in _proc_status.read_text().splitlines():
-                                if _line.startswith("State:"):
-                                    _state = _line.split()[1]
-                                    if _state in ("T", "t"):  # stopped or tracing stop
-                                        stale = True
-                                    break
-                    except (OSError, PermissionError):
-                        pass
+        stale = _scoped_lock_record_is_stale(existing, record)
         if stale:
             try:
                 lock_path.unlink(missing_ok=True)
@@ -656,6 +739,7 @@ def release_all_scoped_locks(
 
 # -- --replace takeover marker -----------------------------------------
 _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
+_PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 _TAKEOVER_MARKER_TTL_S = 60
 
 
@@ -737,6 +821,86 @@ def clear_takeover_marker() -> None:
         pass
 
 
+def _get_planned_stop_marker_path() -> Path:
+    """Return the path to the intentional stop marker file."""
+    home = get_hermes_home()
+    return home / _PLANNED_STOP_MARKER_FILENAME
+
+
+def write_planned_stop_marker(target_pid: int) -> bool:
+    """Record that a gateway stop was requested intentionally."""
+    try:
+        target_start_time = _get_process_start_time(target_pid)
+        record = {
+            "target_pid": target_pid,
+            "target_start_time": target_start_time,
+            "stopper_pid": os.getpid(),
+            "written_at": _utc_now_iso(),
+        }
+        _write_json_file(_get_planned_stop_marker_path(), record)
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def consume_planned_stop_marker_for_self() -> bool:
+    """Return True when a fresh planned-stop marker names this process."""
+    path = _get_planned_stop_marker_path()
+    record = _read_json_file(path)
+    if not record:
+        return False
+
+    try:
+        target_pid = int(record["target_pid"])
+        target_start_time = record.get("target_start_time")
+        written_at = record.get("written_at") or ""
+    except (KeyError, TypeError, ValueError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+    stale = False
+    try:
+        written_dt = datetime.fromisoformat(written_at)
+        age = (datetime.now(timezone.utc) - written_dt).total_seconds()
+        if age > _TAKEOVER_MARKER_TTL_S:
+            stale = True
+    except (TypeError, ValueError):
+        stale = True
+
+    if stale:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+    our_pid = os.getpid()
+    our_start_time = _get_process_start_time(our_pid)
+    matches = (
+        target_pid == our_pid
+        and target_start_time is not None
+        and our_start_time is not None
+        and target_start_time == our_start_time
+    )
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    return matches
+
+
+def clear_planned_stop_marker() -> None:
+    try:
+        _get_planned_stop_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _is_pid_alive_windows(pid: int) -> bool:
     """Check if a PID is alive on Windows using tasklist."""
     try:
@@ -778,27 +942,7 @@ def get_running_pid(
         if pid is None:
             continue
 
-        is_alive = False
-        try:
-            os.kill(pid, 0)
-            is_alive = True
-        except ProcessLookupError:
-            is_alive = False
-        except OSError as e:
-            if platform_info.is_windows:
-                we = getattr(e, "winerror", 0)
-                if we == 87:
-                    is_alive = False
-                elif we == 5:
-                    is_alive = True
-                else:
-                    is_alive = _is_pid_alive_windows(pid)
-            else:
-                is_alive = False
-        except PermissionError:
-            is_alive = True
-
-        if not is_alive:
+        if not _pid_exists(pid):
             continue
 
         recorded_start = record.get("start_time")

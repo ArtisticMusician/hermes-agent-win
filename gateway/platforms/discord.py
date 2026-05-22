@@ -83,6 +83,24 @@ def check_discord_requirements() -> bool:
     return DISCORD_AVAILABLE
 
 
+def _component_check_auth(interaction, allowed_user_ids=None, allowed_role_ids=None) -> bool:
+    allowed_user_ids = set(allowed_user_ids or set())
+    allowed_role_ids = set(allowed_role_ids or set())
+    if not allowed_user_ids and not allowed_role_ids:
+        return True
+    user = getattr(interaction, "user", None)
+    if user is None:
+        return False
+    if allowed_user_ids and str(getattr(user, "id", "")) in allowed_user_ids:
+        return True
+    if allowed_role_ids:
+        roles = getattr(user, "roles", None)
+        if not roles:
+            return False
+        return any(getattr(role, "id", None) in allowed_role_ids for role in roles)
+    return False
+
+
 def _build_allowed_mentions():
     """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
 
@@ -3552,17 +3570,16 @@ if DISCORD_AVAILABLE:
         Only users in the allowed list can click.  Times out after 5 minutes.
         """
 
-        def __init__(self, session_key: str, allowed_user_ids: set):
+        def __init__(self, session_key: str, allowed_user_ids: set, allowed_role_ids: set | None = None):
             super().__init__(timeout=300)  # 5-minute timeout
             self.session_key = session_key
             self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = set(allowed_role_ids or set())
             self.resolved = False
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized."""
-            if not self.allowed_user_ids:
-                return True  # No allowlist = anyone can approve
-            return str(interaction.user.id) in self.allowed_user_ids
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
 
         async def _resolve(
             self, interaction: discord.Interaction, choice: str,
@@ -3636,6 +3653,114 @@ if DISCORD_AVAILABLE:
             for child in self.children:
                 child.disabled = True
 
+    class SlashConfirmView(discord.ui.View):
+        """Interactive confirmation view for destructive slash commands."""
+
+        def __init__(
+            self,
+            session_key: str,
+            confirm_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: set | None = None,
+        ):
+            super().__init__(timeout=300)
+            self.session_key = session_key
+            self.confirm_id = confirm_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = set(allowed_role_ids or set())
+            self.resolved = False
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
+
+    class ClarifyChoiceView(discord.ui.View):
+        """Interactive multiple-choice clarify view."""
+
+        def __init__(
+            self,
+            choices: list[str],
+            clarify_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: set | None = None,
+        ):
+            super().__init__(timeout=300)
+            self.choices = list(choices or [])
+            self.clarify_id = clarify_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = set(allowed_role_ids or set())
+            self.resolved = False
+            self._build_buttons()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
+
+        @staticmethod
+        def _button_label(index: int, choice: str) -> str:
+            body = str(choice)
+            max_body_len = 80 - len(f"{index + 1}. ")
+            if len(body) > max_body_len:
+                body = body[: max_body_len - 3] + "..."
+            return f"{index + 1}. {body}"
+
+        def _disable_all(self) -> None:
+            for child in self.children:
+                child.disabled = True
+
+        def _build_buttons(self) -> None:
+            for index, choice in enumerate(self.choices[:24]):
+                button = discord.ui.Button(
+                    label=self._button_label(index, choice),
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"clarify:{self.clarify_id}:{index}",
+                )
+
+                async def _callback(interaction, _index=index, _choice=choice):
+                    await self._resolve_choice(interaction, _index, _choice)
+
+                button.callback = _callback
+                self.add_item(button)
+            other = discord.ui.Button(
+                label="Other",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"clarify:{self.clarify_id}:other",
+            )
+            other.callback = self._on_other
+            self.add_item(other)
+
+        async def _resolve_choice(self, interaction: discord.Interaction, index: int, choice: str) -> None:
+            if self.resolved:
+                await interaction.response.send_message("This clarification has already been answered.", ephemeral=True)
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to answer this clarification.", ephemeral=True)
+                return
+            self.resolved = True
+            self._disable_all()
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+
+                resolve_gateway_clarify(self.clarify_id, str(choice))
+            except Exception:
+                logger.debug("Failed to resolve Discord clarify choice", exc_info=True)
+            await interaction.response.edit_message(view=self)
+
+        async def _on_other(self, interaction: discord.Interaction) -> None:
+            if self.resolved:
+                await interaction.response.send_message("This clarification has already been answered.", ephemeral=True)
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to answer this clarification.", ephemeral=True)
+                return
+            self.resolved = True
+            self._disable_all()
+            try:
+                from tools.clarify_gateway import mark_awaiting_text
+
+                mark_awaiting_text(self.clarify_id)
+            except Exception:
+                logger.debug("Failed to mark Discord clarify as awaiting text", exc_info=True)
+            await interaction.response.edit_message(view=self)
+
     class UpdatePromptView(discord.ui.View):
         """Interactive Yes/No buttons for ``hermes update`` prompts.
 
@@ -3645,16 +3770,15 @@ if DISCORD_AVAILABLE:
         5-minute timeout on its side).
         """
 
-        def __init__(self, session_key: str, allowed_user_ids: set):
+        def __init__(self, session_key: str, allowed_user_ids: set, allowed_role_ids: set | None = None):
             super().__init__(timeout=300)
             self.session_key = session_key
             self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = set(allowed_role_ids or set())
             self.resolved = False
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
-            if not self.allowed_user_ids:
-                return True
-            return str(interaction.user.id) in self.allowed_user_ids
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
 
         async def _respond(
             self, interaction: discord.Interaction, answer: str,
@@ -3731,6 +3855,7 @@ if DISCORD_AVAILABLE:
             session_key: str,
             on_model_selected,
             allowed_user_ids: set,
+            allowed_role_ids: set | None = None,
         ):
             super().__init__(timeout=120)
             self.providers = providers
@@ -3739,15 +3864,14 @@ if DISCORD_AVAILABLE:
             self.session_key = session_key
             self.on_model_selected = on_model_selected
             self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = set(allowed_role_ids or set())
             self.resolved = False
             self._selected_provider: str = ""
 
             self._build_provider_select()
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
-            if not self.allowed_user_ids:
-                return True
-            return str(interaction.user.id) in self.allowed_user_ids
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
 
         def _build_provider_select(self):
             """Build the provider dropdown menu."""

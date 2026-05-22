@@ -521,10 +521,7 @@ def _report_gateway_start(via: str) -> None:
         print(f"✓ Gateway started via {via} (PID: {', '.join(map(str, pids))})")
     else:
         print(f"⚠ Launched gateway via {via}, but no process detected after 6s.")
-        print("  Check the log for startup errors:")
-        from hermes_cli.config import get_hermes_home
-        print(f"    type {Path(get_hermes_home()).resolve()}\\logs\\gateway.log")
-        print(f"    type {Path(get_hermes_home()).resolve()}\\logs\\gateway-stdio.log")
+        _print_log_guidance(prefix="  ")
 
 
 def _print_next_steps() -> None:
@@ -535,6 +532,47 @@ def _print_next_steps() -> None:
     print("Next steps:")
     print("  hermes gateway status                      # Check status")
     print(f"  type {hermes_home}\\logs\\gateway.log       # View logs")
+
+
+def _gateway_log_paths() -> tuple[Path, Path]:
+    from hermes_cli.config import get_hermes_home
+
+    log_dir = Path(get_hermes_home()).resolve() / "logs"
+    return log_dir / "gateway.log", log_dir / "gateway-stdio.log"
+
+
+def _print_log_guidance(prefix: str = "") -> None:
+    gateway_log, stdio_log = _gateway_log_paths()
+    print(f"{prefix}Check the Windows gateway logs for startup errors:")
+    print(f"{prefix}  type {gateway_log}")
+    print(f"{prefix}  type {stdio_log}")
+
+
+def _print_status_guidance(
+    *,
+    task_installed: bool,
+    startup_installed: bool,
+    pids: list[int],
+) -> None:
+    if task_installed or startup_installed:
+        backend = "Scheduled Task" if task_installed else "Startup-folder login item"
+        print()
+        print(f"Backend: {backend}")
+        if not pids:
+            print("The service is installed but no gateway process is running.")
+            print("  hermes gateway start                       # Start it now")
+            _print_log_guidance(prefix="  ")
+        return
+
+    if pids:
+        print()
+        print("Gateway is running manually, but no Windows login service is installed.")
+        print("  hermes gateway install                     # Start automatically at logon")
+        return
+
+    print()
+    print("To install:")
+    print("  hermes gateway install")
 
 
 def uninstall() -> None:
@@ -637,10 +675,11 @@ def status(deep: bool = False) -> None:
         print(f"  Task script:   {get_task_script_path()}")
         print(f"  Startup entry: {get_startup_entry_path()}")
 
-    if not task_installed and not startup_installed and not pids:
-        print()
-        print("To install:")
-        print("  hermes gateway install")
+    _print_status_guidance(
+        task_installed=task_installed,
+        startup_installed=startup_installed,
+        pids=pids,
+    )
 
 
 def start() -> None:

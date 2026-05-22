@@ -74,7 +74,7 @@ def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, caps
     (project_root / "docker" / "entrypoint.sh").write_text("#!/bin/sh\n")
 
     monkeypatch.setattr(gateway, "PROJECT_ROOT", project_root)
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.delenv("HERMES_ALLOW_ROOT_GATEWAY", raising=False)
     monkeypatch.setattr(gateway, "_is_official_docker_checkout", lambda: True)
 
@@ -96,7 +96,7 @@ def test_run_gateway_root_guard_has_escape_hatch(monkeypatch):
 
     _install_fake_gateway_run(monkeypatch, fake_start_gateway)
     monkeypatch.setattr(gateway.asyncio, "run", lambda coro: True)
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(gateway, "_is_official_docker_checkout", lambda: True)
     monkeypatch.setenv("HERMES_ALLOW_ROOT_GATEWAY", "1")
 
@@ -384,7 +384,7 @@ def test_conflicting_systemd_units_warning(monkeypatch, tmp_path, capsys):
 
 def test_install_linux_gateway_from_setup_system_choice_without_root_prints_followup(monkeypatch, capsys):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
     monkeypatch.setattr(gateway, "systemd_install", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not install")))
 
@@ -398,7 +398,7 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_prints_foll
 
 def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeypatch):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
 
     calls = []
@@ -534,20 +534,20 @@ class TestWaitForGatewayExit:
 
 class TestStopProfileGateway:
     def test_stop_profile_gateway_keeps_pid_file_when_process_still_running(self, monkeypatch):
-        calls = {"kill": 0, "alive_probes": 0, "remove": 0}
+        calls = {"terminate": 0, "alive_probes": 0, "remove": 0, "planned": 0}
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
-        # Post-#21561: the stop loop sends one SIGTERM via ``os.kill`` then
-        # polls liveness via ``gateway.status._pid_exists`` (safe on
-        # Windows — bpo-14484). Instrument both seams separately.
         monkeypatch.setattr(
-            gateway.os,
-            "kill",
-            lambda pid, sig: calls.__setitem__("kill", calls["kill"] + 1),
+            "gateway.status.terminate_pid",
+            lambda pid, force=False: calls.__setitem__("terminate", calls["terminate"] + 1),
         )
         monkeypatch.setattr(
             "gateway.status._pid_exists",
             lambda pid: calls.__setitem__("alive_probes", calls["alive_probes"] + 1) or True,
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda pid: calls.__setitem__("planned", calls["planned"] + 1) or True,
         )
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr(
@@ -556,7 +556,8 @@ class TestStopProfileGateway:
         )
 
         assert gateway.stop_profile_gateway() is True
-        assert calls["kill"] == 1          # one SIGTERM
+        assert calls["planned"] == 1
+        assert calls["terminate"] == 1
         assert calls["alive_probes"] == 20 # 20 liveness polls over the 2s window
         assert calls["remove"] == 0
 

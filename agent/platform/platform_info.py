@@ -18,7 +18,7 @@ class PlatformInfo:
         self.is_wsl = False
         if self.is_linux:
             try:
-                with open('/proc/version', 'r') as f:
+                with open('/proc/version', 'r', encoding='utf-8') as f:
                     if 'microsoft' in f.read().lower():
                         self.is_wsl = True
             except IOError:

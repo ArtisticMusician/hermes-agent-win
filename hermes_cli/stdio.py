@@ -230,6 +230,7 @@ def _augment_path_with_known_tools() -> None:
         os.path.join(local_appdata, "hermes", "git", "cmd"),
         os.path.join(local_appdata, "hermes", "git", "bin"),
         os.path.join(local_appdata, "hermes", "git", "usr", "bin"),
+        os.path.join(local_appdata, "hermes", "hermes-agent", ".venv", "Scripts"),
         # Hermes venv Scripts directory — host of the hermes.exe shim itself,
         # also where any pip-installed console scripts land.  Usually already
         # on PATH when the user invokes hermes, but harmless to include.

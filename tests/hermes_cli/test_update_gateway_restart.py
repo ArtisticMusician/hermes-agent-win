@@ -513,6 +513,7 @@ class TestCmdUpdateLaunchdRestart:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    @pytest.mark.skipif(os.name == "nt", reason="systemd SIGUSR1 restart path is POSIX-only")
     def test_update_prefers_sigusr1_over_systemctl_restart_when_mainpid_known(
         self, mock_run, _mock_which, mock_args, capsys, monkeypatch,
     ):
@@ -523,6 +524,7 @@ class TestCmdUpdateLaunchdRestart:
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli.signal, "SIGUSR1", 10, raising=False)
 
         # Track state: before kill → "active" (old PID),
         # after kill + exit → briefly inactive, then "active" again (new PID).
@@ -571,8 +573,7 @@ class TestCmdUpdateLaunchdRestart:
         sigusr1_sent = {"value": False}
 
         def fake_kill(pid, sig):
-            import signal as _s
-            if pid == 4242 and sig == _s.SIGUSR1:
+            if pid == 4242 and sig == gateway_cli.signal.SIGUSR1:
                 sigusr1_sent["value"] = True
                 state["killed"] = True
                 return

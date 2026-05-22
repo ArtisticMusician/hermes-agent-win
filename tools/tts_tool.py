@@ -550,50 +550,9 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
 
-    if os.name == "nt":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        except Exception:
-            proc.kill()
-        return
+    from agent.platform.process import ProcessManager
 
-    import psutil
-    try:
-        parent = psutil.Process(proc.pid)
-        for child in parent.children(recursive=True):
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        parent.terminate()
-    except psutil.NoSuchProcess:
-        return
-    except Exception:
-        proc.terminate()
-
-    try:
-        proc.wait(timeout=2)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        parent = psutil.Process(proc.pid)
-        for child in parent.children(recursive=True):
-            try:
-                child.kill()
-            except psutil.NoSuchProcess:
-                pass
-        parent.kill()
-    except psutil.NoSuchProcess:
-        return
-    except Exception:
-        proc.kill()
+    ProcessManager.kill_process_tree(proc, escalate=True)
 
 
 def _run_command_tts(command: str, timeout: float) -> subprocess.CompletedProcess:

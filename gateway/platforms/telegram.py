@@ -520,7 +520,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             import yaml as _yaml
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
             # Navigate to platforms.telegram.extra.dm_topics
@@ -2881,7 +2881,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             import yaml as _yaml
-            with open(config_path, "r") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 config = _yaml.safe_load(f) or {}
 
             dm_topics = (

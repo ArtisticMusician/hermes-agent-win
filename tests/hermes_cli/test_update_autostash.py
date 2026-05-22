@@ -319,13 +319,13 @@ def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypa
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd[-2:] == ["fetch", "origin"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+        if cmd[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd[-3:] == ["rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+        if cmd[-4:] == ["pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         if cmd == ["/usr/bin/uv", "pip", "install", "-e", ".[all]"]:
             raise CalledProcessError(returncode=1, cmd=cmd)
@@ -368,13 +368,13 @@ def test_cmd_update_succeeds_with_extras(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         recorded.append(cmd)
-        if cmd == ["git", "fetch", "origin"]:
+        if cmd[-2:] == ["fetch", "origin"]:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+        if cmd[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
             return SimpleNamespace(stdout="main\n", stderr="", returncode=0)
-        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+        if cmd[-3:] == ["rev-list", "HEAD..origin/main", "--count"]:
             return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
-        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+        if cmd[-4:] == ["pull", "--ff-only", "origin", "main"]:
             return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -435,6 +435,40 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
     assert "still installing dependencies" in out
 
 
+def test_windows_update_quarantines_entrypoint_exes(monkeypatch, tmp_path):
+    """Windows self-update must rename live exe shims before uv rewrites them."""
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+    scripts_dir = tmp_path / "Scripts"
+    scripts_dir.mkdir()
+    hermes_exe = scripts_dir / "hermes.exe"
+    gateway_exe = scripts_dir / "hermes-gateway.exe"
+    hermes_exe.write_text("old hermes", encoding="utf-8")
+    gateway_exe.write_text("old gateway", encoding="utf-8")
+
+    moved = hermes_main._quarantine_running_hermes_exe(scripts_dir)
+
+    assert len(moved) == 2
+    assert not hermes_exe.exists()
+    assert not gateway_exe.exists()
+    assert all(quarantined.exists() for _, quarantined in moved)
+    assert all(".exe.old." in quarantined.name for _, quarantined in moved)
+
+
+def test_windows_update_restores_quarantined_exes_on_install_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+    scripts_dir = tmp_path / "Scripts"
+    scripts_dir.mkdir()
+    hermes_exe = scripts_dir / "hermes.exe"
+    hermes_exe.write_text("old hermes", encoding="utf-8")
+
+    moved = hermes_main._quarantine_running_hermes_exe(scripts_dir)
+    hermes_main._restore_quarantined_exes(moved)
+
+    assert hermes_exe.exists()
+    assert hermes_exe.read_text(encoding="utf-8") == "old hermes"
+    assert not moved[0][1].exists()
+
+
 # ---------------------------------------------------------------------------
 # ff-only fallback to reset --hard on diverged history
 # ---------------------------------------------------------------------------
@@ -492,7 +526,8 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
-    assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    assert reset_calls[0][0] == "git"
+    assert reset_calls[0][-3:] == ["reset", "--hard", "origin/main"]
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
@@ -666,3 +701,37 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
+
+
+def test_cmd_update_windows_reset_access_denied_prints_file_lock_hint(monkeypatch, tmp_path, capsys):
+    """Windows git reset failures caused by locked files should be actionable."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(hermes_main.sys, "platform", "win32")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *a, **kw: "abc123deadbeef",
+    )
+
+    side_effect, _ = _make_update_side_effect(
+        ff_only_fails=True,
+        reset_fails=True,
+    )
+
+    def access_denied_reset(cmd, **kwargs):
+        result = side_effect(cmd, **kwargs)
+        joined = " ".join(str(c) for c in cmd)
+        if "reset" in joined and "--hard" in joined:
+            result.stderr = "error: unable to unlink old 'hermes.exe': Access is denied"
+        return result
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", access_denied_reset)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "Windows file-lock hint" in out
+    assert "Close other Hermes terminals, dashboards, editors" in out
+    assert "restart Windows" in out

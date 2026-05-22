@@ -47,6 +47,8 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.path_compat import native_path
+
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
@@ -1451,53 +1453,10 @@ def execute_code(
 
 
 def _kill_process_group(proc, escalate: bool = False):
-    """Kill the child and its entire process tree (cross-platform via psutil)."""
-    import psutil
-    try:
-        parent = psutil.Process(proc.pid)
-        children = parent.children(recursive=True)
-        for child in children:
-            try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        try:
-            parent.terminate()
-        except psutil.NoSuchProcess:
-            pass
-    except psutil.NoSuchProcess:
-        pass
-    except (PermissionError, OSError) as e:
-        logger.debug("Could not terminate process tree: %s", e, exc_info=True)
-        try:
-            proc.kill()
-        except Exception as e2:
-            logger.debug("Could not kill process: %s", e2, exc_info=True)
+    """Kill the child and its entire process tree."""
+    from agent.platform.process import ProcessManager
 
-    if escalate:
-        # Give the process 5s to exit after SIGTERM, then SIGKILL
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                parent = psutil.Process(proc.pid)
-                for child in parent.children(recursive=True):
-                    try:
-                        child.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                try:
-                    parent.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            except psutil.NoSuchProcess:
-                pass
-            except (PermissionError, OSError) as e:
-                logger.debug("Could not kill process tree: %s", e, exc_info=True)
-                try:
-                    proc.kill()
-                except Exception as e2:
-                    logger.debug("Could not kill process: %s", e2, exc_info=True)
+    ProcessManager.kill_process_tree(proc, escalate=escalate)
 
 
 def _load_config() -> dict:
@@ -1632,7 +1591,7 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
         return staging_dir
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
-        expanded = os.path.expanduser(raw)
+        expanded = native_path(os.path.expanduser(raw))
         if os.path.isdir(expanded):
             return expanded
     here = os.getcwd()

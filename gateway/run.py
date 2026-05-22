@@ -30,6 +30,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
+from hermes_cli.stdio import configure_windows_stdio
+
+configure_windows_stdio()
+
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -338,6 +342,120 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
                 queue.append(mapped)
 
     return resolved
+
+
+def _home_target_env_var(platform: str) -> str:
+    """Return the platform home-channel env var name."""
+    name = str(platform or "").strip().upper()
+    suffix = {
+        "MATRIX": "ROOM",
+        "EMAIL": "ADDRESS",
+    }.get(name, "CHANNEL")
+    return f"{name}_HOME_{suffix}"
+
+
+def _home_thread_env_var(platform: str) -> str:
+    return f"{_home_target_env_var(platform)}_THREAD_ID"
+
+
+_ASSISTANT_REPLAY_FIELDS = (
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "finish_reason",
+)
+
+
+def _build_replay_entry(role: str, content: Any, msg: dict) -> dict:
+    entry = {"role": role, "content": content}
+    if role != "assistant" or not isinstance(msg, dict):
+        return entry
+    for field in _ASSISTANT_REPLAY_FIELDS:
+        if field == "reasoning_content":
+            if field in msg and msg[field] is not None:
+                entry[field] = msg[field]
+        elif msg.get(field):
+            entry[field] = msg[field]
+    return entry
+
+
+def _auto_continue_freshness_window() -> float:
+    try:
+        value = float(os.getenv("HERMES_AUTO_CONTINUE_FRESHNESS", "") or 3600.0)
+    except (TypeError, ValueError):
+        return 3600.0
+    return value if value > 0 else 3600.0
+
+
+def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        return ts / 1000.0 if ts > 10_000_000_000 else ts
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return _coerce_gateway_timestamp(float(text))
+        except ValueError:
+            pass
+        try:
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _last_transcript_timestamp(history: Optional[list]) -> Optional[float]:
+    if not history:
+        return None
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") not in {"user", "assistant", "tool"}:
+            continue
+        ts = _coerce_gateway_timestamp(msg.get("timestamp"))
+        if ts is not None:
+            return ts
+        return None
+    return None
+
+
+def _is_fresh_gateway_interruption(last_timestamp: Optional[float], *, now: Optional[float] = None) -> bool:
+    if last_timestamp is None:
+        return True
+    current = time.time() if now is None else now
+    return (current - last_timestamp) <= _auto_continue_freshness_window()
+
+
+def _should_clear_resume_pending_after_turn(result: Optional[dict]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("interrupted") or result.get("failed") or result.get("partial") or result.get("error"):
+        return False
+    if result.get("completed") is False:
+        return False
+    return bool(result.get("final_response") or result.get("completed"))
+
+
+def _preserve_queued_followup_history_offset(current_result: dict, followup_result: dict) -> dict:
+    merged = dict(followup_result or {})
+    offsets = [
+        result.get("history_offset")
+        for result in (current_result or {}, followup_result or {})
+        if isinstance(result, dict) and isinstance(result.get("history_offset"), int)
+    ]
+    if offsets:
+        merged["history_offset"] = min(offsets)
+    return merged
 
 logger = logging.getLogger(__name__)
 
@@ -1886,6 +2004,27 @@ class GatewayRunner:
             return
 
         current_pid = os.getpid()
+        if sys.platform == "win32":
+            from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+            helper = (
+                "import psutil, subprocess, sys, time\n"
+                "pid = int(sys.argv[1])\n"
+                "argv = sys.argv[2:]\n"
+                "while psutil.pid_exists(pid):\n"
+                "    time.sleep(0.2)\n"
+                "raise SystemExit(subprocess.call(argv))\n"
+            )
+            subprocess.Popen(
+                [sys.executable, "-c", helper, str(current_pid), *hermes_cmd, "gateway", "restart"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                **windows_detach_popen_kwargs(),
+            )
+            return
+
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
             f"while kill -0 {current_pid} 2>/dev/null; do sleep 0.2; done; "
@@ -2187,22 +2326,34 @@ class GatewayRunner:
                 self._request_clean_exit(reason)
                 return True
             if enabled_platform_count > 0:
-                reason = "; ".join(startup_retryable_errors) or "all configured messaging platforms failed to connect"
-                logger.error("Gateway failed to connect any configured messaging platform: %s", reason)
-                try:
-                    from gateway.status import write_runtime_status
-                    write_runtime_status(gateway_state="startup_failed", exit_reason=reason)
-                except Exception:
-                    pass
-                return False
-            logger.warning("No messaging platforms enabled.")
-            logger.info("Gateway will continue running for cron job execution.")
+                if startup_retryable_errors:
+                    reason = "; ".join(startup_retryable_errors)
+                    logger.warning(
+                        "Gateway has no connected messaging platforms yet; continuing in degraded retry mode: %s",
+                        reason,
+                    )
+                    try:
+                        from gateway.status import write_runtime_status
+                        write_runtime_status(gateway_state="degraded", exit_reason=reason)
+                    except Exception:
+                        pass
+                else:
+                    logger.warning(
+                        "No adapter could be created for any enabled messaging platform; continuing for cron job execution."
+                    )
+                    logger.info("Gateway will continue running for cron job execution.")
+            else:
+                logger.warning("No messaging platforms enabled.")
+                logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
         self.delivery_router.adapters = self.adapters
         
         self._running = True
-        self._update_runtime_status("running")
+        if connected_count == 0 and self._failed_platforms:
+            self._update_runtime_status("degraded")
+        else:
+            self._update_runtime_status("running")
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -7843,23 +7994,46 @@ class GatewayRunner:
             f"status=$?; printf '%s' \"$status\" > {shlex.quote(str(exit_code_path))}"
         )
         try:
-            setsid_bin = shutil.which("setsid")
-            if setsid_bin:
-                # Preferred: setsid creates a new session, fully detached
+            if sys.platform == "win32":
+                from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+
+                helper = (
+                    "import os, subprocess, sys\n"
+                    "out_path, code_path, *argv = sys.argv[1:]\n"
+                    "env = dict(os.environ)\n"
+                    "env['PYTHONUNBUFFERED'] = '1'\n"
+                    "with open(out_path, 'ab', buffering=0) as out:\n"
+                    "    proc = subprocess.run(argv, stdout=out, stderr=subprocess.STDOUT, env=env)\n"
+                    "with open(code_path, 'w', encoding='utf-8') as fh:\n"
+                    "    fh.write(str(proc.returncode))\n"
+                    "raise SystemExit(proc.returncode)\n"
+                )
                 subprocess.Popen(
-                    [setsid_bin, "bash", "-c", update_cmd],
+                    [sys.executable, "-c", helper, str(output_path), str(exit_code_path), *hermes_cmd, "update", "--gateway"],
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+                    close_fds=True,
+                    **windows_detach_popen_kwargs(),
                 )
             else:
-                # Fallback: start_new_session=True calls os.setsid() in child
-                subprocess.Popen(
-                    ["bash", "-c", update_cmd],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                setsid_bin = shutil.which("setsid")
+                if setsid_bin:
+                    # Preferred: setsid creates a new session, fully detached
+                    subprocess.Popen(
+                        [setsid_bin, "bash", "-c", update_cmd],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                else:
+                    # Fallback: start_new_session=True calls os.setsid() in child
+                    subprocess.Popen(
+                        ["bash", "-c", update_cmd],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
         except Exception as e:
             pending_path.unlink(missing_ok=True)
             exit_code_path.unlink(missing_ok=True)
@@ -10997,12 +11171,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     pass
                 return False
             # Wait up to 10 seconds for the old process to exit
+            from gateway.status import _pid_exists
             for _ in range(20):
-                try:
-                    os.kill(existing_pid, 0)
-                    time.sleep(0.5)
-                except (ProcessLookupError, PermissionError):
+                if not _pid_exists(existing_pid):
                     break  # Process is gone
+                time.sleep(0.5)
             else:
                 # Still alive after 10s - force kill
                 logger.warning(
@@ -11106,16 +11279,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # both services are enabled, e.g. hermes.service + hermes-
         # gateway.service from pre-rename installs).
         planned_takeover = False
+        planned_stop = False
         try:
-            from gateway.status import consume_takeover_marker_for_self
+            from gateway.status import (
+                consume_planned_stop_marker_for_self,
+                consume_takeover_marker_for_self,
+            )
             planned_takeover = consume_takeover_marker_for_self()
+            planned_stop = consume_planned_stop_marker_for_self()
         except Exception as e:
-            logger.debug("Takeover marker check failed: %s", e)
+            logger.debug("Shutdown marker check failed: %s", e)
 
         if planned_takeover:
             logger.info(
                 "Received SIGTERM as a planned --replace takeover - exiting cleanly"
             )
+        elif planned_stop:
+            logger.info("Received SIGTERM as a planned gateway stop - exiting cleanly")
         else:
             _signal_initiated_shutdown = True
             logger.info("Received SIGTERM/SIGINT - initiating shutdown")
@@ -11151,12 +11331,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop.add_signal_handler(sig, shutdown_signal_handler)
+                loop.add_signal_handler(sig, shutdown_signal_handler)  # windows-footgun: ok — guarded for Windows asyncio
             except NotImplementedError:
                 pass
-        if hasattr(signal, "SIGUSR1"):
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None:
             try:
-                loop.add_signal_handler(signal.SIGUSR1, restart_signal_handler)
+                loop.add_signal_handler(sigusr1, restart_signal_handler)  # windows-footgun: ok — POSIX signal if present
             except NotImplementedError:
                 pass
     else:

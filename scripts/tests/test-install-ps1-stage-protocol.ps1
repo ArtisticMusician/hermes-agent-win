@@ -46,6 +46,20 @@ function Assert-True {
 }
 
 # -----------------------------------------------------------------------------
+# Test: install.ps1 parses as valid PowerShell
+# -----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "-- PowerShell parser --"
+$parseErrors = $null
+$tokens = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $installScript,
+    [ref]$tokens,
+    [ref]$parseErrors
+) | Out-Null
+Assert-Equal -Expected 0 -Actual $parseErrors.Count -Label "install.ps1 has no PowerShell parse errors"
+
+# -----------------------------------------------------------------------------
 # Test: -ProtocolVersion emits a single integer
 # -----------------------------------------------------------------------------
 Write-Host ""
@@ -89,7 +103,7 @@ if ($manifest) {
 
     # Specific stage names that the GUI driver will rely on
     $names = $manifest.stages | ForEach-Object { $_.name }
-    foreach ($expected in @("uv", "python", "git", "venv", "dependencies", "configure", "gateway")) {
+    foreach ($expected in @("uv", "python", "git", "node", "ripgrep", "ffmpeg", "venv", "dependencies", "configure", "gateway")) {
         Assert-True ($names -contains $expected) -Label "manifest contains stage '$expected'"
     }
 

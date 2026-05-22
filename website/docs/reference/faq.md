@@ -30,7 +30,15 @@ Set your provider with `hermes model` or by editing `~/.hermes/.env`. See the [E
 
 ### Does it work on Windows?
 
-**Not natively.** Hermes Agent requires a Unix-like environment. On Windows, install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run Hermes from inside it. The standard install command works perfectly in WSL2:
+**Yes, with two paths.** Native Windows support is available as an early beta through the PowerShell installer:
+
+```powershell
+irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex
+```
+
+The native installer provisions Python, uv, Node.js, ripgrep, ffmpeg, and PortableGit/Git Bash. The classic CLI, tools, and gateway run natively. The dashboard `/chat` terminal pane still requires a POSIX PTY, so use WSL2 for that specific feature.
+
+For the most battle-tested Windows setup, install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) and run Hermes from inside it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash

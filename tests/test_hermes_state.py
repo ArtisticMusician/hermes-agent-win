@@ -2748,6 +2748,33 @@ class TestAutoMaintenance:
         assert not (sessions_dir / "old.jsonl").exists()
         assert (sessions_dir / "active.jsonl").exists()
 
+    def test_remove_session_files_does_not_traverse_outside_sessions_dir(self, db, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        outside = tmp_path / "escape.jsonl"
+        outside.write_text("{}\n", encoding="utf-8")
+
+        db._remove_session_files(sessions_dir, "../escape")
+
+        assert outside.exists()
+
+    def test_remove_session_files_treats_glob_chars_literally(self, db, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        literal = sessions_dir / "sess[1].jsonl"
+        other = sessions_dir / "sess1.jsonl"
+        literal_dump = sessions_dir / "request_dump_sess[1]_001.json"
+        other_dump = sessions_dir / "request_dump_sess1_001.json"
+        for path in (literal, other, literal_dump, other_dump):
+            path.write_text("{}\n", encoding="utf-8")
+
+        db._remove_session_files(sessions_dir, "sess[1]")
+
+        assert not literal.exists()
+        assert not literal_dump.exists()
+        assert other.exists()
+        assert other_dump.exists()
+
 
 # =========================================================================
 # FTS5 indexing of tool_calls / tool_name (#16751)

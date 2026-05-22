@@ -2484,15 +2484,33 @@ class SessionDB:
         """
         if sessions_dir is None:
             return
+        try:
+            root = Path(sessions_dir).resolve()
+            session_id = str(session_id)
+        except OSError:
+            return
+
         for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
+            filename = f"{session_id}{suffix}"
+            if Path(filename).name != filename:
+                continue
+            p = root / filename
             try:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
-        # request_dump files use session_id as a prefix component
+
+        # request_dump files use session_id as a prefix component. Avoid
+        # Path.glob here: session IDs can be caller-provided in API flows, and
+        # glob metacharacters would otherwise overmatch unrelated dumps.
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+            prefix = f"request_dump_{session_id}_"
+            for p in root.iterdir():
+                if not p.is_file():
+                    continue
+                name = p.name
+                if not (name.startswith(prefix) and name.endswith(".json")):
+                    continue
                 try:
                     p.unlink(missing_ok=True)
                 except OSError:

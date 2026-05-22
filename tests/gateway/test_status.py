@@ -551,6 +551,35 @@ class TestScopedLocks:
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
 
+    def test_acquire_scoped_lock_uses_pid_exists_for_windows_dead_pid(self, tmp_path, monkeypatch):
+        """Windows stale locks must not depend on os.kill(pid, 0)."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        }))
+
+        def fail_if_called(pid, sig):
+            raise AssertionError("acquire_scoped_lock must use _pid_exists, not os.kill")
+
+        monkeypatch.setattr(status.os, "kill", fail_if_called)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+
+        acquired, existing = status.acquire_scoped_lock(
+            "telegram-bot-token",
+            "secret",
+            metadata={"platform": "telegram"},
+        )
+
+        assert acquired is True
+        assert existing is None
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+
     def test_acquire_scoped_lock_recovers_empty_lock_file(self, tmp_path, monkeypatch):
         """Empty lock file (0 bytes) left by a crashed process should be treated as stale."""
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))

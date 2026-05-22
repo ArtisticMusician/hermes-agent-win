@@ -53,6 +53,71 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+  windows-native:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        shell: pwsh
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          uv venv .venv --python 3.11
+          .\.venv\Scripts\python.exe -m pip install -U pip
+          uv pip install --python .\.venv\Scripts\python.exe -e ".[dev]"
+
+      - name: Run installer protocol smoke tests
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-stage-protocol.ps1
+
+      - name: Run terminal, path, and process Windows tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -o addopts="-m 'not integration'" `
+            tests/tools/test_terminal_windows_native_contract.py `
+            tests/tools/test_local_env_windows_msys.py `
+            tests/tools/test_windows_path_compat.py `
+            tests/tools/test_resolve_path.py `
+            tests/tools/test_code_execution_modes.py `
+            tests/tools/test_process_registry.py::TestKillProcess `
+            tests/tools/test_windows_native_support.py `
+            tests/agent/platform/test_process.py `
+            tests/gateway/test_status.py `
+            tests/scripts/test_windows_packaging.py `
+            -q --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Run gateway and update Windows tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -o addopts="-m 'not integration'" `
+            tests/gateway/test_status.py `
+            tests/gateway/test_runner_startup_failures.py `
+            tests/hermes_cli/test_gateway.py `
+            tests/hermes_cli/test_gateway_windows.py `
+            tests/hermes_cli/test_gateway_service.py `
+            tests/hermes_cli/test_update_autostash.py `
+            tests/hermes_cli/test_whatsapp_setup_ordering.py `
+            tests/hermes_cli/test_web_ui_build.py `
+            tests/hermes_cli/test_tui_npm_install.py `
+            tests/hermes_cli/test_tui_resume_flow.py `
+            -q --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -233,6 +233,29 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
     return {}, {"proxy": proxy_url}
 
 
+def is_host_excluded_by_no_proxy(host: str, no_proxy: str | None = None) -> bool:
+    """Return True when *host* matches a NO_PROXY-style exclusion list."""
+    if no_proxy is None:
+        no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+    host = (host or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    for raw in re.split(r"[\s,]+", no_proxy or ""):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token == "*":
+            return True
+        token = token.split(":", 1)[0].strip("[]")
+        if token.startswith("."):
+            suffix = token[1:]
+            if host == suffix or host.endswith("." + suffix):
+                return True
+        elif host == token or host.endswith("." + token):
+            return True
+    return False
+
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -768,6 +791,45 @@ class SendResult:
     retryable: bool = False  # True for transient connection errors — base will retry automatically
 
 
+@dataclass(frozen=True)
+class EphemeralReply:
+    """Text response that may be deleted after a short platform-specific TTL."""
+
+    text: str
+    ttl_seconds: Optional[int] = None
+
+
+def _reply_anchor_for_event(event: MessageEvent) -> Optional[str]:
+    """Return the message id that should be used as the reply anchor."""
+    if not event:
+        return None
+    source = getattr(event, "source", None)
+    if (
+        getattr(source, "platform", None) == Platform.TELEGRAM
+        and getattr(source, "chat_type", None) == "dm"
+        and getattr(source, "thread_id", None)
+        and getattr(event, "message_id", None)
+    ):
+        return event.message_id
+    return event.reply_to_message_id or event.message_id
+
+
+def _thread_metadata_for_source(source: SessionSource, reply_anchor: Optional[str] = None) -> Optional[dict]:
+    """Build platform-neutral send metadata for threaded sources."""
+    thread_id = getattr(source, "thread_id", None)
+    if not thread_id:
+        return None
+    metadata = {"thread_id": str(thread_id)}
+    if (
+        getattr(source, "platform", None) == Platform.TELEGRAM
+        and getattr(source, "chat_type", None) == "dm"
+    ):
+        metadata["telegram_dm_topic_reply_fallback"] = True
+        if reply_anchor:
+            metadata["telegram_reply_to_message_id"] = str(reply_anchor)
+    return metadata
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -1126,6 +1188,57 @@ class BasePlatformAdapter(ABC):
         consumer) and leave it ``False`` on intermediate edits.
         """
         return SendResult(success=False, error="Not supported")
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a message if the platform supports it.
+
+        The base implementation is a no-op so cleanup/ephemeral flows can
+        safely call it while still detecting whether a concrete adapter
+        actually overrides deletion.
+        """
+        return False
+
+    def _supports_delete_message(self) -> bool:
+        return type(self).delete_message is not BasePlatformAdapter.delete_message
+
+    def _get_ephemeral_system_ttl_default(self) -> int:
+        try:
+            value = (getattr(self.config, "extra", {}) or {}).get("ephemeral_system_ttl", 0)
+            return max(0, int(value or 0))
+        except Exception:
+            return 0
+
+    def _unwrap_ephemeral(self, response: Any) -> tuple[Any, int]:
+        if not isinstance(response, EphemeralReply):
+            return response, 0
+        try:
+            ttl = (
+                response.ttl_seconds
+                if response.ttl_seconds is not None
+                else self._get_ephemeral_system_ttl_default()
+            )
+            ttl = max(0, int(ttl or 0))
+        except Exception:
+            ttl = 0
+        if ttl and not self._supports_delete_message():
+            ttl = 0
+        return response.text, ttl
+
+    def _schedule_ephemeral_delete(self, chat_id: str, message_id: str, ttl_seconds: int) -> None:
+        if not chat_id or not message_id or ttl_seconds <= 0 or not self._supports_delete_message():
+            return
+
+        async def _delete_later() -> None:
+            try:
+                await asyncio.sleep(max(1, int(ttl_seconds)))
+                await self.delete_message(chat_id, message_id)
+            except Exception:
+                logger.debug("Failed to delete ephemeral gateway reply", exc_info=True)
+
+        try:
+            asyncio.create_task(_delete_later())
+        except RuntimeError:
+            return
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
@@ -1995,7 +2108,12 @@ class BasePlatformAdapter(ABC):
 
             # Default behavior for non-photo follow-ups: interrupt the running agent
             logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
-            self._pending_messages[session_key] = event
+            merge_pending_message_event(
+                self._pending_messages,
+                session_key,
+                event,
+                merge_text=True,
+            )
             # Signal the interrupt (the processing task checks this)
             self._active_sessions[session_key].set()
             return  # Don't process now - will be handled after current task finishes

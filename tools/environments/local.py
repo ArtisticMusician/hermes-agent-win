@@ -3,7 +3,6 @@
 import logging
 import os
 import platform
-import re
 import shutil
 import signal
 import subprocess
@@ -11,6 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from hermes_cli.path_compat import msys_to_windows_path
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -27,15 +27,7 @@ def _msys_to_windows_path(cwd: str) -> str:
     Returns the input unchanged when no translation applies. This is
     idempotent — calling it on an already-Windows path returns it as-is.
     """
-    if not _IS_WINDOWS or not cwd:
-        return cwd
-    # Match leading "/<single letter>/" or exactly "/<letter>" (bare drive root).
-    m = re.match(r'^/([a-zA-Z])(/.*)?$', cwd)
-    if not m:
-        return cwd
-    drive = m.group(1).upper()
-    tail = (m.group(2) or "").replace('/', '\\')
-    return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
+    return msys_to_windows_path(cwd, is_windows=_IS_WINDOWS)
 
 
 def _resolve_safe_cwd(cwd: str) -> str:
@@ -226,8 +218,33 @@ def _find_bash() -> str:
             or "/bin/sh"
         )
 
+    def _is_wsl_bash(path: str) -> bool:
+        try:
+            resolved = os.path.abspath(path).lower().replace("/", "\\")
+        except Exception:
+            return False
+        system_root = os.environ.get("SystemRoot", r"C:\Windows").lower().replace("/", "\\")
+        return resolved == f"{system_root}\\system32\\bash.exe"
+
+    def _windows_git_bash_error(reason: str) -> RuntimeError:
+        return RuntimeError(
+            f"{reason}\n"
+            "Git Bash not found. Hermes Agent requires Git for Windows on native Windows.\n"
+            "The WSL bash launcher is not supported for native Windows terminal execution.\n"
+            "Run scripts\\install.ps1 to install the Hermes-managed Portable Git, install Git for Windows from "
+            "https://git-scm.com/download/win, or set HERMES_GIT_BASH_PATH to your Git for Windows bash.exe."
+        )
+
     custom = os.environ.get("HERMES_GIT_BASH_PATH")
-    if custom and os.path.isfile(custom):
+    if custom:
+        if not os.path.isfile(custom):
+            raise _windows_git_bash_error(
+                f"HERMES_GIT_BASH_PATH points at a missing file: {custom}"
+            )
+        if _is_wsl_bash(custom):
+            raise _windows_git_bash_error(
+                f"HERMES_GIT_BASH_PATH points at the WSL bash launcher: {custom}"
+            )
         return custom
 
     # Prefer our own portable Git install first — this way a broken or
@@ -251,7 +268,9 @@ def _find_bash() -> str:
 
     found = shutil.which("bash")
     if found:
-        return found
+        if not _is_wsl_bash(found):
+            return found
+        logger.debug("Ignoring WSL bash launcher for native Windows terminal: %s", found)
 
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
@@ -261,10 +280,8 @@ def _find_bash() -> str:
         if candidate and os.path.isfile(candidate):
             return candidate
 
-    raise RuntimeError(
-        "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
-        "Install it from: https://git-scm.com/download/win\n"
-        "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
+    raise _windows_git_bash_error(
+        "No Git for Windows bash.exe was found in Hermes Portable Git, PATH, or standard Git install locations."
     )
 
 
@@ -457,7 +474,16 @@ class LocalEnvironment(BaseEnvironment):
                 cache_dir = get_hermes_home() / "cache" / "terminal"
             except Exception:
                 cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
-            cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.debug(
+                    "Could not create Hermes terminal cache dir %s: %s; falling back to system temp",
+                    cache_dir,
+                    exc,
+                )
+                cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
+                cache_dir.mkdir(parents=True, exist_ok=True)
             # Force forward slashes so the same string serves both contexts.
             return str(cache_dir).replace("\\", "/")
 

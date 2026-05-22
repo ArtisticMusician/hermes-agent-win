@@ -60,6 +60,7 @@ from .config import (
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
 )
+from .whatsapp_identity import canonical_whatsapp_identifier, normalize_whatsapp_identifier  # noqa: F401
 
 
 @dataclass

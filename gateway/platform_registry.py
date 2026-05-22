@@ -75,6 +75,10 @@ class PlatformEntry:
     # or a generic "set these env vars" display.
     setup_fn: Optional[Callable[[], None]] = None
 
+    # Optional out-of-process sender for cron/delivery paths where the live
+    # gateway adapter is unavailable.
+    standalone_sender_fn: Optional[Callable[..., Any]] = None
+
     # "builtin" or "plugin"
     source: str = "plugin"
 
@@ -124,6 +128,11 @@ class PlatformEntry:
     # platform as a valid ``deliver=<name>`` target and reads the env var to
     # resolve the default chat/room ID.  Empty = no cron home-channel support.
     cron_deliver_env_var: str = ""
+
+    # Optional config.yaml bridge hook. Receives the full YAML config and this
+    # platform's top-level YAML block. May mutate environment and/or return a
+    # dict to merge into PlatformConfig.extra.
+    apply_yaml_config_fn: Optional[Callable[[dict, dict], Optional[dict]]] = None
 
 
 class PlatformRegistry:

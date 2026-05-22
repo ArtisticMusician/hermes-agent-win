@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 from hermes_constants import get_hermes_dir
+from hermes_cli._subprocess_compat import resolve_node_command, windows_hide_flags
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +95,8 @@ def _terminate_bridge_process(proc, *, force: bool = False) -> None:
 
     import signal
 
-    sig = signal.SIGTERM if not force else signal.SIGKILL
-    os.killpg(os.getpgid(proc.pid), sig)
+    sig = signal.SIGTERM if not force else getattr(signal, "SIGKILL", signal.SIGTERM)
+    os.killpg(os.getpgid(proc.pid), sig)  # windows-footgun: ok — POSIX branch only
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -121,10 +122,11 @@ def check_whatsapp_requirements() -> bool:
     # Check for Node.js
     try:
         result = subprocess.run(
-            ["node", "--version"],
+            resolve_node_command("node", ["--version"]),
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            creationflags=windows_hide_flags(),
         )
         return result.returncode == 0
     except Exception:
@@ -380,11 +382,12 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 try:
                     install_result = subprocess.run(
-                        ["npm", "install", "--silent"],
+                        resolve_node_command("npm", ["install", "--silent"]),
                         cwd=str(bridge_dir),
                         capture_output=True,
                         text=True,
                         timeout=60,
+                        creationflags=windows_hide_flags(),
                     )
                     if install_result.returncode != 0:
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
@@ -429,7 +432,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # messages are preserved for troubleshooting.
             whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
-            bridge_log_fh = open(self._bridge_log, "a")
+            bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
 
             # Build bridge subprocess environment.
@@ -440,16 +443,16 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
 
             self._bridge_process = subprocess.Popen(
-                [
-                    "node",
+                resolve_node_command("node", [
                     str(bridge_path),
                     "--port", str(self._bridge_port),
                     "--session", str(self._session_path),
                     "--mode", whatsapp_mode,
-                ],
+                ]),
                 stdout=bridge_log_fh,
                 stderr=bridge_log_fh,
                 preexec_fn=None if _IS_WINDOWS else os.setsid,
+                creationflags=windows_hide_flags(),
                 env=bridge_env,
             )
             

@@ -41,13 +41,15 @@ import time
 import uuid
 
 from agent.platform import ProcessManager, platform_info
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = platform.system() == "Windows"
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -59,9 +61,15 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 
 # Watch pattern rate limiting
-WATCH_MAX_PER_WINDOW = 8        # Max notifications delivered per window
-WATCH_WINDOW_SECONDS = 10       # Rolling window length
-WATCH_OVERLOAD_KILL_SECONDS = 45  # Sustained overload duration before disabling watch
+WATCH_MIN_INTERVAL_SECONDS = 15
+WATCH_STRIKE_LIMIT = 3
+WATCH_GLOBAL_MAX_PER_WINDOW = 8
+WATCH_GLOBAL_WINDOW_SECONDS = 10
+WATCH_GLOBAL_COOLDOWN_SECONDS = 45
+# Backward-compatible names for older callers/tests.
+WATCH_MAX_PER_WINDOW = WATCH_GLOBAL_MAX_PER_WINDOW
+WATCH_WINDOW_SECONDS = WATCH_GLOBAL_WINDOW_SECONDS
+WATCH_OVERLOAD_KILL_SECONDS = WATCH_GLOBAL_COOLDOWN_SECONDS
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -73,6 +81,55 @@ def format_uptime_short(seconds: int) -> str:
         return f"{mins}m {secs}s"
     hours, mins = divmod(mins, 60)
     return f"{hours}h {mins}m"
+
+
+def _trim_notification_text(text: Any, limit: int = 2000) -> str:
+    value = "" if text is None else str(text)
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n... [{omitted} chars omitted]"
+
+
+def format_process_notification(event: dict[str, Any]) -> str:
+    """Format a background-process event for injection into an agent turn."""
+    event_type = str(event.get("type") or "unknown")
+
+    if event_type == "completion":
+        session_id = event.get("session_id") or "unknown"
+        command = event.get("command") or "unknown"
+        exit_code = event.get("exit_code")
+        output = _trim_notification_text(event.get("output") or "")
+        return (
+            f"[IMPORTANT: Background process {session_id} completed with "
+            f"exit code {exit_code}.\n"
+            f"Command: {command}\n"
+            f"Output:\n{output}]"
+        )
+
+    if event_type == "watch_match":
+        session_id = event.get("session_id") or "unknown"
+        command = event.get("command") or "unknown"
+        pattern = event.get("pattern") or "unknown"
+        output = _trim_notification_text(event.get("output") or "")
+        suppressed = int(event.get("suppressed") or 0)
+        suppressed_note = (
+            f"\nNote: {suppressed} earlier matches were suppressed by rate limiting."
+            if suppressed
+            else ""
+        )
+        return (
+            f"[IMPORTANT: Background process {session_id} matched watch pattern "
+            f"\"{pattern}\".\n"
+            f"Command: {command}\n"
+            f"Matched output:\n{output}{suppressed_note}]"
+        )
+
+    if event_type == "watch_disabled":
+        message = event.get("message") or "Watch patterns disabled for unknown process."
+        return f"[IMPORTANT: {message}]"
+
+    return f"[IMPORTANT: Background process notification type {event_type}: {event}]"
 
 
 @dataclass
@@ -109,6 +166,9 @@ class ProcessSession:
     _watch_disabled: bool = field(default=False, repr=False) # permanently killed by overload
     _watch_window_hits: int = field(default=0, repr=False)   # hits in current rate window
     _watch_window_start: float = field(default=0.0, repr=False)
+    _watch_cooldown_until: float = field(default=0.0, repr=False)
+    _watch_consecutive_strikes: int = field(default=0, repr=False)
+    _watch_strike_candidate: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -135,7 +195,7 @@ class ProcessRegistry:
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -151,6 +211,12 @@ class ProcessRegistry:
         # via wait/poll/log.  Drain loops skip notifications for these.
         self._completion_consumed: set = set()
 
+        self._global_watch_window_start: float = 0.0
+        self._global_watch_window_hits: int = 0
+        self._global_watch_tripped_until: float = 0.0
+        self._global_watch_suppressed_during_trip: int = 0
+        self._checkpoint_write_disabled = False
+
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
         """Strip shell startup warnings from the beginning of output."""
@@ -163,11 +229,10 @@ class ProcessRegistry:
         """Scan new output for watch patterns and queue notifications.
 
         Called from reader threads with new_text being the freshly-read chunk.
-        Rate-limited: max WATCH_MAX_PER_WINDOW notifications per WATCH_WINDOW_SECONDS.
-        If sustained overload exceeds WATCH_OVERLOAD_KILL_SECONDS, watching is
-        disabled permanently for this process.
+        Rate-limited per session and globally so noisy logs cannot spam the
+        gateway with follow-up turns.
         """
-        if not session.watch_patterns or session._watch_disabled:
+        if session.exited or not session.watch_patterns or session._watch_disabled:
             return
 
         # Scan new text line-by-line for pattern matches
@@ -185,21 +250,51 @@ class ProcessRegistry:
             return
 
         now = time.time()
+        release_event = None
+        with self._lock:
+            if self._global_watch_tripped_until > 0:
+                if now < self._global_watch_tripped_until:
+                    self._global_watch_suppressed_during_trip += len(matched_lines)
+                    return
+                release_event = {
+                    "type": "watch_overflow_released",
+                    "suppressed": self._global_watch_suppressed_during_trip,
+                    "message": (
+                        "Background watch-pattern global rate limit released "
+                        f"after suppressing {self._global_watch_suppressed_during_trip} matches."
+                    ),
+                }
+                self._global_watch_tripped_until = 0.0
+                self._global_watch_suppressed_during_trip = 0
+                self._global_watch_window_start = now
+                self._global_watch_window_hits = 0
+
+            if now - self._global_watch_window_start >= WATCH_GLOBAL_WINDOW_SECONDS:
+                self._global_watch_window_start = now
+                self._global_watch_window_hits = 0
+
+            if self._global_watch_window_hits >= WATCH_GLOBAL_MAX_PER_WINDOW:
+                self._global_watch_tripped_until = now + WATCH_GLOBAL_COOLDOWN_SECONDS
+                self._global_watch_suppressed_during_trip += len(matched_lines)
+                self.completion_queue.put({
+                    "type": "watch_overflow_tripped",
+                    "suppressed": self._global_watch_suppressed_during_trip,
+                    "message": (
+                        "Background watch-pattern global rate limit tripped. "
+                        f"Suppressing matches for {WATCH_GLOBAL_COOLDOWN_SECONDS}s."
+                    ),
+                })
+                return
+
         with session._lock:
-            # Reset window if it's expired
-            if now - session._watch_window_start >= WATCH_WINDOW_SECONDS:
-                session._watch_window_hits = 0
-                session._watch_window_start = now
-
-            # Check rate limit
-            if session._watch_window_hits >= WATCH_MAX_PER_WINDOW:
+            if session._watch_cooldown_until and now < session._watch_cooldown_until:
                 session._watch_suppressed += len(matched_lines)
-
-                # Track sustained overload for kill switch
-                if session._watch_overload_since == 0.0:
-                    session._watch_overload_since = now
-                elif now - session._watch_overload_since > WATCH_OVERLOAD_KILL_SECONDS:
+                if not session._watch_strike_candidate:
+                    session._watch_consecutive_strikes += 1
+                    session._watch_strike_candidate = True
+                if session._watch_consecutive_strikes >= WATCH_STRIKE_LIMIT:
                     session._watch_disabled = True
+                    session.notify_on_complete = True
                     self.completion_queue.put({
                         "session_id": session.id,
                         "session_key": session.session_key,
@@ -212,18 +307,21 @@ class ProcessRegistry:
                         "user_name": session.watcher_user_name,
                         "thread_id": session.watcher_thread_id,
                         "message": (
-                            f"Watch patterns disabled for process {session.id} — "
+                            f"Watch patterns disabled for process {session.id} - "
                             f"too many matches ({session._watch_suppressed} suppressed). "
-                            f"Use process(action='poll') to check output manually."
+                            "Promoted to notify_on_complete; use process(action='poll') "
+                            "to check output manually."
                         ),
                     })
                 return
 
-            # Under the rate limit — deliver notification
-            session._watch_window_hits += 1
+            if session._watch_cooldown_until and now >= session._watch_cooldown_until:
+                if not session._watch_strike_candidate:
+                    session._watch_consecutive_strikes = 0
+                session._watch_strike_candidate = False
+
             session._watch_hits += 1
-            # Clear overload tracker since we got a delivery through
-            session._watch_overload_since = 0.0
+            session._watch_cooldown_until = now + WATCH_MIN_INTERVAL_SECONDS
 
             # Include suppressed count if any events were dropped
             suppressed = session._watch_suppressed
@@ -233,6 +331,23 @@ class ProcessRegistry:
         output = "\n".join(matched_lines[:20])
         if len(output) > 2000:
             output = output[:2000] + "\n...(truncated)"
+
+        if release_event:
+            self.completion_queue.put(release_event)
+
+        with self._lock:
+            if self._global_watch_window_hits >= WATCH_GLOBAL_MAX_PER_WINDOW:
+                self._global_watch_tripped_until = time.time() + WATCH_GLOBAL_COOLDOWN_SECONDS
+                self.completion_queue.put({
+                    "type": "watch_overflow_tripped",
+                    "suppressed": self._global_watch_suppressed_during_trip,
+                    "message": (
+                        "Background watch-pattern global rate limit tripped. "
+                        f"Suppressing matches for {WATCH_GLOBAL_COOLDOWN_SECONDS}s."
+                    ),
+                })
+                return
+            self._global_watch_window_hits += 1
 
         self.completion_queue.put({
             "session_id": session.id,
@@ -255,9 +370,10 @@ class ProcessRegistry:
         if not pid:
             return False
         try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError):
+            from gateway.status import _pid_exists
+
+            return bool(_pid_exists(pid))
+        except Exception:
             return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
@@ -282,18 +398,12 @@ class ProcessRegistry:
     @staticmethod
     def _terminate_host_pid(pid: int) -> None:
         """Terminate a host-visible PID without requiring the original process handle."""
-        if platform_info.is_windows:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError, PermissionError):
-                pass
-            return
-            return
-
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            from gateway.status import terminate_pid
+
+            terminate_pid(pid, force=True)
         except (OSError, ProcessLookupError, PermissionError):
-            os.kill(pid, signal.SIGTERM)
+            pass
 
     # ----- Spawn -----
 
@@ -334,7 +444,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
-            cwd=cwd or os.getcwd(),
+            cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
 
@@ -404,6 +514,7 @@ class ProcessRegistry:
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE,
             preexec_fn=None if platform_info.is_windows else os.setsid,
+            creationflags=subprocess.CREATE_NO_WINDOW if platform_info.is_windows else 0,
         )
 
         session.process = proc
@@ -652,6 +763,27 @@ class ProcessRegistry:
         """Check if a completion notification was already consumed via wait/poll/log."""
         return session_id in self._completion_consumed
 
+    def drain_notifications(self) -> list[tuple[dict[str, Any], str]]:
+        """Drain pending process notifications and format agent-turn messages.
+
+        Notifications for sessions already consumed through poll/log/wait are
+        skipped so the user does not get duplicate completion messages after
+        manually checking a finished process.
+        """
+        drained: list[tuple[dict[str, Any], str]] = []
+        while True:
+            try:
+                event = self.completion_queue.get_nowait()
+            except Exception:
+                break
+
+            session_id = str(event.get("session_id") or "")
+            if session_id and session_id in self._completion_consumed:
+                continue
+
+            drained.append((event, format_process_notification(event)))
+        return drained
+
     def get(self, session_id: str) -> Optional[ProcessSession]:
         """Get a session by ID (running or finished)."""
         with self._lock:
@@ -809,16 +941,19 @@ class ProcessRegistry:
                     session._pty.terminate(force=True)
                 except Exception:
                     if session.pid:
-                        os.kill(session.pid, signal.SIGTERM)
+                        self._terminate_host_pid(session.pid)
             elif session.process:
                 # Local process -- kill the process group
                 try:
                     if platform_info.is_windows:
-                        session.process.terminate()
+                        self._terminate_host_pid(session.process.pid)
                     else:
-                        os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)
+                        os.killpg(os.getpgid(session.process.pid), signal.SIGTERM)  # windows-footgun: ok — POSIX branch only
                 except (ProcessLookupError, PermissionError, OSError):
-                    session.process.kill()
+                    if platform_info.is_windows and session.process.pid:
+                        self._terminate_host_pid(session.process.pid)
+                    else:
+                        session.process.kill()
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -1010,6 +1145,9 @@ class ProcessRegistry:
 
     def _write_checkpoint(self):
         """Write running process metadata to checkpoint file atomically."""
+        if self._checkpoint_write_disabled:
+            return
+
         try:
             with self._lock:
                 entries = []
@@ -1033,10 +1171,36 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+
+            # Atomic write to avoid corruption on crash.  On native Windows,
+            # AV/sync/sandbox filters can block forever inside mkstemp/fsync
+            # for user-profile paths.  Checkpointing is best-effort recovery
+            # metadata; it must never wedge terminal(background=True).
+            errors: list[BaseException] = []
+
+            def _writer() -> None:
+                try:
+                    from utils import atomic_json_write
+
+                    atomic_json_write(CHECKPOINT_PATH, entries)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            writer = threading.Thread(
+                target=_writer,
+                daemon=True,
+                name="process-registry-checkpoint-write",
+            )
+            writer.start()
+            writer.join(timeout=2.0 if _IS_WINDOWS else 10.0)
+            if writer.is_alive():
+                self._checkpoint_write_disabled = True
+                logger.debug(
+                    "Timed out writing process checkpoint to %s; disabling checkpoint writes for this process",
+                    CHECKPOINT_PATH,
+                )
+            elif errors:
+                raise errors[0]
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 

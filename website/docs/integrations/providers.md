@@ -875,7 +875,7 @@ To set persistent per-model defaults: My Models tab → gear icon on the model �
 
 ### WSL2 Networking (Windows Users)
 
-Since Hermes Agent requires a Unix environment, Windows users run it inside WSL2. If your model server (Ollama, LM Studio, etc.) runs on the **Windows host**, you need to bridge the network gap — WSL2 uses a virtual network adapter with its own subnet, so `localhost` inside WSL2 refers to the Linux VM, **not** the Windows host.
+This section applies when you choose to run Hermes inside WSL2. Hermes also has an early-beta native Windows installer, but WSL2 is still useful when you want POSIX semantics or the dashboard `/chat` terminal pane. If Hermes runs in WSL2 and your model server (Ollama, LM Studio, etc.) runs on the **Windows host**, you need to bridge the network gap — WSL2 uses a virtual network adapter with its own subnet, so `localhost` inside WSL2 refers to the Linux VM, **not** the Windows host.
 
 :::tip Both in WSL2? No problem.
 If your model server also runs inside WSL2 (common for vLLM, SGLang, and llama-server), `localhost` works as expected — they share the same network namespace. Skip this section.

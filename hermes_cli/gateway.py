@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import logging
 import os
 import shutil
 import signal
@@ -36,6 +37,8 @@ from hermes_cli.setup import (
     prompt, prompt_choice, prompt_yes_no,
 )
 from hermes_cli.colors import Colors, color
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -164,12 +167,13 @@ def _is_pid_ancestor_of_current_process(target_pid: int) -> bool:
 
 def _request_gateway_self_restart(pid: int) -> bool:
     """Ask a running gateway ancestor to restart itself asynchronously."""
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if not _is_pid_ancestor_of_current_process(pid):
         return False
     try:
-        os.kill(pid, signal.SIGUSR1)
+        os.kill(pid, sigusr1)
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
@@ -200,12 +204,13 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
         False if SIGUSR1 couldn't be sent or the process didn't exit in
         time (caller should fall back to a harder restart path).
     """
-    if not hasattr(signal, "SIGUSR1"):
+    sigusr1 = getattr(signal, "SIGUSR1", None)
+    if sigusr1 is None:
         return False
     if pid <= 0:
         return False
     try:
-        os.kill(pid, signal.SIGUSR1)
+        os.kill(pid, sigusr1)
     except ProcessLookupError:
         # Already gone - nothing to drain.
         return True
@@ -213,17 +218,12 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
         return False
 
     import time as _time
+    from gateway.status import _pid_exists
 
     deadline = _time.monotonic() + max(drain_timeout, 1.0)
     while _time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)  # signal 0 - probe liveness
-        except ProcessLookupError:
+        if not _pid_exists(pid):
             return True
-        except PermissionError:
-            # Process still exists but we can't signal it.  Treat as alive
-            # so the caller falls back.
-            pass
         _time.sleep(0.5)
     # Drain didn't finish in time.
     return False
@@ -640,7 +640,14 @@ def stop_profile_gateway() -> bool:
     Returns True if a process was stopped, False if none was found.
     """
     try:
-        from gateway.status import get_running_pid, remove_pid_file
+        from gateway.status import (
+            get_running_pid,
+            remove_pid_file,
+            terminate_pid,
+            _pid_exists,
+            write_planned_stop_marker,
+            clear_planned_stop_marker,
+        )
     except ImportError:
         return False
 
@@ -648,22 +655,26 @@ def stop_profile_gateway() -> bool:
     if pid is None:
         return False
 
+    write_planned_stop_marker(pid)
     try:
-        os.kill(pid, signal.SIGTERM)
+        terminate_pid(pid, force=False)
     except ProcessLookupError:
         pass  # Already gone
     except PermissionError:
+        clear_planned_stop_marker()
         print(f"! Permission denied to kill PID {pid}")
+        return False
+    except OSError as exc:
+        clear_planned_stop_marker()
+        print(f"Failed to stop gateway PID {pid}: {exc}")
         return False
 
     # Wait briefly for it to exit
     import time as _time
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-            _time.sleep(0.5)
-        except (ProcessLookupError, PermissionError):
+        if not _pid_exists(pid):
             break
+        _time.sleep(0.5)
 
     if get_running_pid() is None:
         remove_pid_file()
@@ -729,6 +740,11 @@ def is_macos() -> bool:
 
 def is_windows() -> bool:
     return sys.platform == 'win32'
+
+
+def _is_official_docker_checkout() -> bool:
+    """Return True when running from the packaged Docker checkout."""
+    return (PROJECT_ROOT / "docker" / "entrypoint.sh").exists()
 
 
 # =============================================================================
@@ -824,9 +840,22 @@ class UserSystemdUnavailableError(RuntimeError):
     """
 
 
+def _current_uid() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return None
+    return getuid()
+
+
+def _running_as_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid is not None and geteuid() == 0)
+
+
 def _user_dbus_socket_path() -> Path:
     """Return the expected per-user D-Bus socket path (regardless of existence)."""
-    xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    uid = _current_uid()
+    xdg = os.environ.get("XDG_RUNTIME_DIR") or (f"/run/user/{uid}" if uid is not None else "")
     return Path(xdg) / "bus"
 
 
@@ -839,7 +868,10 @@ def _ensure_user_systemd_env() -> None:
     We detect the standard socket path and set the vars so all subsequent
     subprocess calls inherit them.
     """
-    uid = os.getuid()
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return
+    uid = getuid()
     if "XDG_RUNTIME_DIR" not in os.environ:
         runtime_dir = f"/run/user/{uid}"
         if Path(runtime_dir).exists():
@@ -905,7 +937,7 @@ def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
             username,
             reason="User D-Bus socket is missing even though linger is enabled.",
             fix_hint=(
-                f"  systemctl start user@{os.getuid()}.service\n"
+                f"  systemctl start user@{_current_uid()}.service\n"
                 "  (may require sudo; try again after the command succeeds)"
             ),
         )
@@ -1175,7 +1207,7 @@ def remove_legacy_hermes_units(
 
     # System-scope removal (needs root)
     if system_units:
-        if os.geteuid() != 0:
+        if not _running_as_root():
             print()
             print_warning("System-scope legacy units require root to remove.")
             print_info("  Re-run with: sudo hermes gateway migrate-legacy")
@@ -1222,7 +1254,7 @@ def print_systemd_scope_conflict_warning() -> None:
 
 
 def _require_root_for_system_service(action: str) -> None:
-    if os.geteuid() != 0:
+    if not _running_as_root():
         print(f"System gateway {action} requires root. Re-run with sudo.")
         sys.exit(1)
 
@@ -1288,7 +1320,7 @@ def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, b
 
     if scope == "system":
         run_as_user = _default_system_service_user()
-        if os.geteuid() != 0:
+        if not _running_as_root():
             print_warning("  System service install requires sudo, so Hermes can't create it from this user session.")
             if run_as_user:
                 print_info(f"  After setup, run: sudo hermes gateway install --system --run-as-user {run_as_user}")
@@ -1332,7 +1364,8 @@ def get_systemd_linger_status() -> tuple[bool | None, str]:
     if not username:
         try:
             import pwd
-            username = pwd.getpwuid(os.getuid()).pw_name
+            uid = _current_uid()
+            username = pwd.getpwuid(uid).pw_name if uid is not None else None
         except Exception:
             return None, "could not determine current user"
 
@@ -1382,7 +1415,10 @@ def _launchd_user_home() -> Path:
     """
     import pwd
 
-    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    uid = _current_uid()
+    if uid is None:
+        return Path.home()
+    return Path(pwd.getpwuid(uid).pw_dir)
 
 
 def get_launchd_plist_path() -> Path:
@@ -1507,15 +1543,23 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _build_service_path_dirs(project_root: Path = PROJECT_ROOT) -> list[str]:
+    """Return optional service PATH dirs that actually exist."""
+    candidates = [
+        Path(project_root) / "node_modules" / ".bin",
+        get_hermes_home() / "node_modules" / ".bin",
+    ]
+    return [str(path) for path in candidates if path.exists()]
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
     venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
-    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
 
-    path_entries = [venv_bin, node_bin]
+    path_entries = [venv_bin, *_build_service_path_dirs(project_root=PROJECT_ROOT)]
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
@@ -1851,6 +1895,7 @@ def systemd_restart(system: bool = False):
     pid = get_running_pid()
     if pid is not None and _request_gateway_self_restart(pid):
         import time
+        from gateway.status import _pid_exists
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
 
@@ -1858,11 +1903,9 @@ def systemd_restart(system: bool = False):
         print(f"... {scope_label} service draining active work...")
         deadline = time.time() + 90
         while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-                time.sleep(1)
-            except (ProcessLookupError, PermissionError):
+            if not _pid_exists(pid):
                 break  # old process is gone
+            time.sleep(1)
         else:
             print(f"! Old process (PID {pid}) still alive after 90s")
 
@@ -2006,7 +2049,10 @@ def get_launchd_label() -> str:
 
 
 def _launchd_domain() -> str:
-    return f"gui/{os.getuid()}"
+    uid = _current_uid()
+    if uid is None:
+        raise RuntimeError("launchd user domain requires a POSIX uid")
+    return f"gui/{uid}"
 
 
 def generate_launchd_plist() -> str:
@@ -2025,10 +2071,9 @@ def generate_launchd_plist() -> str:
     detected_venv = _detect_venv_dir()
     venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = [venv_bin, node_bin]
+    priority_dirs = [venv_bin, *_build_service_path_dirs(project_root=PROJECT_ROOT)]
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
@@ -2235,7 +2280,7 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
             # Grace period expired - force-kill the specific PID.
             try:
                 terminate_pid(pid, force=True)
-                print(f"! Gateway PID {pid} did not exit gracefully; sent SIGKILL")
+                print(f"! Gateway PID {pid} did not exit gracefully; sent force kill")
             except (ProcessLookupError, PermissionError, OSError):
                 return True  # Already gone or we can't touch it.
             force_sent = True
@@ -2335,6 +2380,18 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
                  This prevents systemd restart loops when the old process
                  hasn't fully exited yet.
     """
+    geteuid = getattr(os, "geteuid", None)
+    if (
+        geteuid is not None
+        and geteuid() == 0
+        and _is_official_docker_checkout()
+        and os.environ.get("HERMES_ALLOW_ROOT_GATEWAY") != "1"
+    ):
+        print_error("Refusing to run the Hermes gateway as root in the official Docker checkout.")
+        print_info("Use the container entrypoint instead: /opt/hermes/docker/entrypoint.sh")
+        print_info("Set HERMES_ALLOW_ROOT_GATEWAY=1 only if you intentionally need this.")
+        sys.exit(1)
+
     sys.path.insert(0, str(PROJECT_ROOT))
     
     from gateway.run import start_gateway
@@ -2350,7 +2407,19 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     # Exit with code 1 if gateway fails to connect any platform,
     # so systemd Restart=on-failure will retry on transient errors
     verbosity = None if quiet else verbose
-    success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+    if is_windows() and os.environ.get("HERMES_GATEWAY_DETACHED") == "1":
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            sigbreak = getattr(signal, "SIGBREAK", None)
+            if sigbreak is not None:
+                signal.signal(sigbreak, signal.SIG_IGN)
+        except (OSError, ValueError):
+            logger.debug("Could not ignore detached Windows console controls", exc_info=True)
+    try:
+        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+    except KeyboardInterrupt:
+        print("Gateway stopped.")
+        return
     if not success:
         sys.exit(1)
 
@@ -4246,104 +4315,31 @@ def _gateway_command_inner(args):
         remove_legacy_hermes_units(interactive=not yes, dry_run=dry_run)
 
 
-# -- Windows Task Scheduler implementation -----------------------------------
+# -- Windows service wrappers -------------------------------------------------
 
 def windows_install(force: bool = False):
-    """Install the gateway as a Windows Task Scheduler task."""
-    import subprocess
-    import os
-    from pathlib import Path
+    """Install the gateway through the profile-aware Windows backend."""
+    from hermes_cli import gateway_windows
 
-    task_name = "HermesGateway"
-
-    # Check if exists
-    result = subprocess.run(["schtasks", "/Query", "/TN", task_name], capture_output=True, text=True)
-    if result.returncode == 0 and not force:
-        print(f"Service {task_name} is already installed.")
-        print(f"Use 'hermes gateway install --force' to overwrite.")
-        sys.exit(1)
-
-    python_exe = sys.executable
-    # Let's run `pythonw.exe -m hermes_cli.main gateway run` if pythonw exists, else python
-    pythonw = python_exe.replace("python.exe", "pythonw.exe")
-    if not os.path.exists(pythonw):
-        pythonw = python_exe
-
-    cmd = f'"{pythonw}" -m hermes_cli.main gateway run'
-
-    # Delete if forcing
-    if force and result.returncode == 0:
-        subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True)
-
-    print(f"Installing {task_name} task to run on logon...")
-    install_result = subprocess.run([
-        "schtasks", "/Create",
-        "/TN", task_name,
-        "/TR", cmd,
-        "/SC", "ONLOGON",
-        "/F",          # Force overwrite if needed
-        "/IT"          # Interactive Token
-    ], capture_output=True, text=True)
-
-    if install_result.returncode != 0:
-        print(f"Failed to create task: {install_result.stderr}")
-        sys.exit(1)
-
-    print(f"+ Installed {task_name}.")
-    print("  The gateway will start automatically when you log in.")
-    print("  You can start it now with: hermes gateway start")
+    gateway_windows.install(force=force)
 
 def windows_uninstall():
-    """Remove the Windows Task Scheduler task."""
-    import subprocess
-    task_name = "HermesGateway"
-    result = subprocess.run(["schtasks", "/Query", "/TN", task_name], capture_output=True)
-    if result.returncode != 0:
-        print(f"Service {task_name} is not installed.")
-        return
+    """Remove the Windows Scheduled Task or Startup fallback."""
+    from hermes_cli import gateway_windows
 
-    print(f"Removing {task_name}...")
-    subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True)
-    print(f"+ Removed {task_name}.")
+    gateway_windows.uninstall()
 
 def windows_start():
-    import subprocess
-    import sys
-    task_name = "HermesGateway"
-    result = subprocess.run(["schtasks", "/Run", "/TN", task_name], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Failed to start {task_name}. Is it installed? (hermes gateway install)")
-        sys.exit(1)
-    print(f"+ Started {task_name}.")
+    from hermes_cli import gateway_windows
+
+    gateway_windows.start()
 
 def windows_stop():
-    import subprocess
-    task_name = "HermesGateway"
-    result = subprocess.run(["schtasks", "/End", "/TN", task_name], capture_output=True)
-    if result.returncode != 0:
-        print(f"Could not stop {task_name} (it may not be running).")
-    else:
-        print(f"+ Stopped {task_name}.")
+    from hermes_cli import gateway_windows
+
+    gateway_windows.stop()
 
 def windows_status(deep: bool = False, full: bool = False):
-    import subprocess
-    task_name = "HermesGateway"
-    result = subprocess.run(["schtasks", "/Query", "/TN", task_name, "/V", "/FO", "LIST"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print("Service status: NOT INSTALLED")
-        return
+    from hermes_cli import gateway_windows
 
-    status = "UNKNOWN"
-    for line in result.stdout.splitlines():
-        if line.startswith("Status:"):
-            status = line.split(":", 1)[1].strip()
-
-    print(f"Service status: INSTALLED (Status: {status})")
-
-    # We still print process status
-    snapshot = get_gateway_runtime_snapshot()
-    _print_gateway_process_mismatch(snapshot)
-    if snapshot.gateway_pids:
-        print(f"Process status: RUNNING (PID: {snapshot.gateway_pids[0]})")
-    else:
-        print("Process status: STOPPED")
+    gateway_windows.status(deep=deep or full)

@@ -812,7 +812,7 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
-    def test_kill_detached_session_uses_host_pid(self, registry):
+    def test_kill_detached_session_uses_host_pid(self, registry, tmp_path):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
@@ -820,30 +820,44 @@ class TestKillProcess:
 
         terminate_calls = []
 
-        class FakeProcess:
-            def __init__(self, pid):
-                self.pid = pid
-            def children(self, recursive=False):
-                return []
-            def terminate(self):
-                terminate_calls.append(("terminate", self.pid))
-
-        import psutil as _psutil
-
         try:
-            # Post-#21561: liveness probe routes through
-            # ``ProcessRegistry._is_host_pid_alive`` (→
-            # ``gateway.status._pid_exists``), and the actual kill on POSIX
-            # routes through ``psutil.Process(pid).terminate()``. Neither
-            # touches ``os.kill`` directly. Mock both seams.
-            with patch("gateway.status._pid_exists", return_value=True), \
-                 patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
+            # Liveness probe routes through ``gateway.status._pid_exists`` and
+            # termination through ``gateway.status.terminate_pid`` so Windows
+            # can taskkill the whole process tree.
+            with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+                 patch("gateway.status._pid_exists", return_value=True), \
+                 patch(
+                     "gateway.status.terminate_pid",
+                     side_effect=lambda pid, force=False: terminate_calls.append((pid, force)),
+                 ):
                 result = registry.kill_process(s.id)
 
             assert result["status"] == "killed"
-            assert ("terminate", 424242) in terminate_calls
+            assert terminate_calls == [(424242, True)]
         finally:
             registry._running.pop(s.id, None)
+
+    def test_windows_local_kill_uses_tree_termination(self, registry, monkeypatch, tmp_path):
+        class FakePopen:
+            pid = 12345
+            stdin = None
+
+        s = _make_session(sid="proc_winlocal", command="server")
+        s.pid = 12345
+        s.process = FakePopen()
+        registry._running[s.id] = s
+        terminate_calls = []
+
+        monkeypatch.setattr("tools.process_registry.platform_info.is_windows", True)
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"), \
+             patch(
+            "gateway.status.terminate_pid",
+            side_effect=lambda pid, force=False: terminate_calls.append((pid, force)),
+        ):
+            result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert terminate_calls == [(12345, True)]
 
 
 # =========================================================================

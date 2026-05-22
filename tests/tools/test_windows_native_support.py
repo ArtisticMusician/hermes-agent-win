@@ -51,9 +51,10 @@ class TestConfigureWindowsStdio:
         yield
         sys.modules.pop("hermes_cli.stdio", None)
 
-    def test_no_op_on_posix(self):
+    def test_no_op_when_platform_helper_reports_posix(self, monkeypatch):
         from hermes_cli import stdio
 
+        monkeypatch.setattr(stdio, "is_windows", lambda: False)
         assert stdio.is_windows() is False
         result = stdio.configure_windows_stdio()
         assert result is False
@@ -288,6 +289,8 @@ class TestSigkillFallback:
 
     def test_getattr_fallback_prefers_sigkill_when_present(self):
         """On POSIX the fallback is a no-op: real SIGKILL wins."""
+        if not hasattr(signal, "SIGKILL"):
+            pytest.skip("SIGKILL is not available on this platform")
         result = getattr(signal, "SIGKILL", signal.SIGTERM)
         assert result == signal.SIGKILL
 
@@ -459,6 +462,91 @@ class TestReadmeNoLongerSaysWindowsUnsupported:
         source = (root / "README.md").read_text(encoding="utf-8")
         assert "install.ps1" in source, (
             "README.md must point at scripts/install.ps1 for Windows users"
+        )
+
+
+class TestWindowsDocsDoNotSuggestWslBashForNative:
+    """Native Windows docs must match runtime bash discovery rules."""
+
+    def test_native_docs_do_not_allow_wsl_bash_override(self):
+        root = Path(__file__).resolve().parents[2]
+        docs = "\n".join(
+            [
+                (root / "README.md").read_text(encoding="utf-8"),
+                (root / "website" / "docs" / "user-guide" / "windows-native.md").read_text(encoding="utf-8"),
+                (root / "website" / "docs" / "reference" / "environment-variables.md").read_text(encoding="utf-8"),
+            ]
+        )
+        forbidden = (
+            "WSL bash via symlink",
+            "WSL-hosted bash via a symlink",
+            "Point at any bash",
+            "points at any bash",
+            "MinGit download is all you need",
+        )
+        for phrase in forbidden:
+            assert phrase not in docs
+
+    def test_faq_no_longer_claims_windows_requires_wsl(self):
+        root = Path(__file__).resolve().parents[2]
+        faq = (root / "website" / "docs" / "reference" / "faq.md").read_text(encoding="utf-8")
+        providers = (root / "website" / "docs" / "integrations" / "providers.md").read_text(encoding="utf-8")
+        assert "Not natively. Hermes Agent requires a Unix-like environment" not in faq
+        assert "Since Hermes Agent requires a Unix environment" not in providers
+        assert "scripts/install.ps1" in faq
+
+
+class TestInstallPs1NativeWindowsBootstrap:
+    """Static invariants for the native Windows installer.
+
+    The PowerShell protocol smoke test covers runtime metadata output. These
+    source-level checks cover side-effectful stages without running downloads,
+    winget, PATH writes, git clone, or dependency installs.
+    """
+
+    def _source(self) -> str:
+        root = Path(__file__).resolve().parents[2]
+        return (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    def test_stage_parameter_allows_structured_unknown_stage_errors(self):
+        source = self._source()
+        assert "[ValidateSet(" not in source, (
+            "install.ps1 must not use ValidateSet on -Stage; unknown stages "
+            "must reach Invoke-Stage so GUI drivers receive JSON plus exit 2"
+        )
+        assert "unknown stage '$Name'" in source
+
+    def test_installer_covers_documented_bootstrap_tools(self):
+        source = self._source()
+        for expected in (
+            "Ensure-Python",
+            "Ensure-Uv",
+            "Ensure-Git",
+            "Ensure-Node",
+            "Ensure-Ripgrep",
+            "Ensure-Ffmpeg",
+            "HERMES_GIT_BASH_PATH",
+            "PortableGit",
+            "hermes.cmd",
+        ):
+            assert expected in source
+
+    def test_installer_uses_dotvenv_and_explicit_uv_python_target(self):
+        source = self._source()
+        assert 'Invoke-External $uv "venv" ".venv" "--python" $python' in source
+        assert (
+            'Invoke-External $uv "pip" "install" "--python" $venvPython "-e" ".[all]"'
+            in source
+        )
+        assert r"\venv\Scripts\python.exe" in source, (
+            "legacy venv fallback should remain for old checkouts"
+        )
+
+    def test_installer_has_no_control_character_path_typos(self):
+        source = self._source()
+        assert "\b" not in source, (
+            "PowerShell installer contains a backspace control character, "
+            "usually from a mistyped \\bin PATH suffix"
         )
 
 
@@ -790,6 +878,16 @@ class TestLocalEnvironmentPathInjectionGated:
         assert 'not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":")' in source
 
 
+class TestStartupPathMatchesInstaller:
+    """Startup PATH repair must mirror installer-managed directories."""
+
+    def test_stdio_augments_dotvenv_and_legacy_venv(self):
+        root = Path(__file__).resolve().parents[2]
+        source = (root / "hermes_cli" / "stdio.py").read_text(encoding="utf-8")
+        assert 'os.path.join(local_appdata, "hermes", "hermes-agent", ".venv", "Scripts")' in source
+        assert 'os.path.join(local_appdata, "hermes", "hermes-agent", "venv", "Scripts")' in source
+
+
 # ---------------------------------------------------------------------------
 # cli.py git path normalization
 # ---------------------------------------------------------------------------
@@ -855,14 +953,15 @@ class TestGatewayDetachedWatcherWindowsFlags:
 
     def test_hermes_cli_gateway_uses_compat_kwargs(self):
         root = Path(__file__).resolve().parents[2]
-        source = (root / "hermes_cli" / "gateway.py").read_text(encoding="utf-8")
-        assert "windows_detach_popen_kwargs" in source, (
-            "hermes_cli/gateway.py must use the platform-aware detach helper"
+        source = (
+            (root / "hermes_cli" / "gateway.py").read_text(encoding="utf-8")
+            + "\n"
+            + (root / "hermes_cli" / "gateway_windows.py").read_text(encoding="utf-8")
         )
-        # The legacy start_new_session=True on the outer Popen should be
-        # replaced by **windows_detach_popen_kwargs(). Inside the watcher
-        # STRING the old pattern is replaced by explicit creationflags.
-        assert "**windows_detach_popen_kwargs()" in source
+        assert "windows_detach_popen_kwargs" in source or "DETACHED_PROCESS" in source, (
+            "Windows gateway launch must use platform-aware detached process flags"
+        )
+        assert "creationflags=flags" in source
 
     def test_gateway_run_update_has_windows_branch(self):
         root = Path(__file__).resolve().parents[2]
