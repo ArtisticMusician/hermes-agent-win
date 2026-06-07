@@ -840,6 +840,13 @@ class UserSystemdUnavailableError(RuntimeError):
     """
 
 
+class SystemScopeRequiresRootError(RuntimeError):
+    """Raised when a system-scope gateway action requires root."""
+
+    def __str__(self) -> str:
+        return self.args[0] if self.args else ""
+
+
 def _current_uid() -> int | None:
     getuid = getattr(os, "getuid", None)
     if getuid is None:
@@ -1255,8 +1262,10 @@ def print_systemd_scope_conflict_warning() -> None:
 
 def _require_root_for_system_service(action: str) -> None:
     if not _running_as_root():
-        print(f"System gateway {action} requires root. Re-run with sudo.")
-        sys.exit(1)
+        raise SystemScopeRequiresRootError(
+            f"System gateway {action} requires root. Re-run with sudo.",
+            action,
+        )
 
 
 def _system_service_identity(run_as_user: str | None = None) -> tuple[str, str, str]:
@@ -1768,6 +1777,29 @@ def _select_systemd_scope(system: bool = False) -> bool:
     if system:
         return True
     return get_systemd_unit_path(system=True).exists() and not get_systemd_unit_path(system=False).exists()
+
+
+def _system_scope_wizard_would_need_root(system: bool = False) -> bool:
+    """Return whether the wizard would run a system action without root."""
+    if _running_as_root():
+        return False
+    return _select_systemd_scope(system=system)
+
+
+def _print_system_scope_remediation(action: str) -> None:
+    """Print recovery steps for a non-root system-scope gateway action."""
+    service_name = get_service_name()
+    print_warning(
+        f"Gateway is installed as a system-wide service - "
+        f"{action} requires root."
+    )
+    print_info("  Options:")
+    print_info(f"    1. {action.capitalize()} it this time:")
+    print_info(f"         sudo systemctl {action} {service_name}")
+    print_info("    2. Switch to a per-user service (recommended for personal use):")
+    print_info("         sudo hermes gateway uninstall --system")
+    print_info("         hermes gateway install")
+    print_info("         hermes gateway start")
 
 
 def _get_restart_drain_timeout() -> float:
@@ -2796,13 +2828,130 @@ _PLATFORMS = [
 ]
 
 
+def _load_bundled_platform_plugins_for_enumeration() -> set[str]:
+    """Load bundled platform plugins so disabled plugins appear in setup."""
+    try:
+        import yaml as _yaml
+    except ImportError:
+        return set()
+
+    from hermes_cli.plugins import (
+        get_bundled_plugins_dir,
+        get_plugin_manager,
+        PluginManifest,
+    )
+
+    manager = get_plugin_manager()
+    platforms_dir = get_bundled_plugins_dir() / "platforms"
+    if not platforms_dir.is_dir():
+        return set()
+
+    disabled_plugin_names: set[str] = set()
+    for child in sorted(platforms_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        manifest_file = child / "plugin.yaml"
+        if not manifest_file.exists():
+            manifest_file = child / "plugin.yml"
+        if not manifest_file.exists():
+            continue
+
+        try:
+            data = _yaml.safe_load(manifest_file.read_text()) or {}
+        except Exception as exc:
+            logger.debug("failed to parse %s: %s", manifest_file, exc)
+            continue
+        plugin_name = data.get("name", child.name)
+
+        existing = manager._plugins.get(plugin_name)
+        if existing is not None and existing.enabled:
+            continue
+
+        manifest = PluginManifest(
+            name=plugin_name,
+            version=str(data.get("version", "")),
+            description=data.get("description", ""),
+            author=data.get("author", ""),
+            requires_env=data.get("requires_env", []),
+            provides_tools=data.get("provides_tools", []),
+            provides_hooks=data.get("provides_hooks", []),
+            source="bundled",
+            path=str(child),
+        )
+        try:
+            manager._load_plugin(manifest)
+        except Exception as exc:
+            logger.debug("failed to force-load %s: %s", plugin_name, exc)
+            continue
+        disabled_plugin_names.add(plugin_name)
+
+    return disabled_plugin_names
+
+
+def _all_platforms() -> list[dict]:
+    """Return built-in and plugin platforms available in the setup picker."""
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as exc:
+        logger.debug("plugin discovery failed during platform enumeration: %s", exc)
+
+    disabled_plugin_names = _load_bundled_platform_plugins_for_enumeration()
+    platforms = [dict(platform) for platform in _PLATFORMS]
+    by_key = {platform["key"]: platform for platform in platforms}
+
+    try:
+        from gateway.platform_registry import platform_registry
+    except Exception:
+        platform_registry = None
+
+    if platform_registry is not None:
+        for entry in platform_registry.all_entries():
+            if entry.name in by_key:
+                continue
+            needs_enable = (
+                bool(entry.plugin_name)
+                and entry.plugin_name in disabled_plugin_names
+            )
+            platforms.append({
+                "key": entry.name,
+                "label": entry.label,
+                "emoji": entry.emoji,
+                "token_var": entry.required_env[0] if entry.required_env else "",
+                "install_hint": entry.install_hint,
+                "_registry_entry": entry,
+                "needs_enable": needs_enable,
+            })
+
+    if is_windows():
+        platforms = [
+            platform
+            for platform in platforms
+            if platform.get("key") != "matrix"
+        ]
+
+    return platforms
+
+
 def _platform_status(platform: dict) -> str:
     """Return a plain-text status string for a platform.
 
     Returns uncolored text so it can safely be embedded in
     simple_term_menu items (ANSI codes break width calculation).
     """
-    token_var = platform["token_var"]
+    registry_entry = platform.get("_registry_entry")
+    if registry_entry is not None:
+        try:
+            configured = bool(registry_entry.check_fn())
+        except Exception:
+            configured = False
+        if platform.get("needs_enable") and not configured:
+            return "plugin disabled - select to enable"
+        return "configured" if configured else "not configured"
+
+    token_var = platform.get("token_var", "")
+    if not token_var:
+        return "not configured"
     val = get_env_value(token_var)
     if token_var == "WHATSAPP_ENABLED":
         if val and val.lower() == "true":
@@ -3749,6 +3898,83 @@ def _setup_signal():
     print_info(f"  Account: {account}")
     print_info("  DM auth: via SIGNAL_ALLOWED_USERS + DM pairing")
     print_info(f"  Groups: {'enabled' if get_env_value('SIGNAL_GROUP_ALLOWED_USERS') else 'disabled'}")
+
+
+def _builtin_setup_fn(key: str):
+    """Resolve the interactive setup function for a built-in platform."""
+    from hermes_cli import setup as setup_module
+
+    return {
+        "telegram": setup_module._setup_telegram,
+        "discord": setup_module._setup_discord,
+        "slack": setup_module._setup_slack,
+        "matrix": setup_module._setup_matrix,
+        "mattermost": setup_module._setup_mattermost,
+        "bluebubbles": setup_module._setup_bluebubbles,
+        "webhooks": setup_module._setup_webhooks,
+        "signal": _setup_signal,
+        "whatsapp": _setup_whatsapp,
+        "weixin": _setup_weixin,
+        "dingtalk": _setup_dingtalk,
+        "feishu": _setup_feishu,
+        "wecom": _setup_wecom,
+        "qqbot": _setup_qqbot,
+    }.get(key)
+
+
+def _enable_plugin_for_platform(plugin_name: str, platform_label: str) -> None:
+    """Add a selected platform plugin to the enabled plugin set."""
+    try:
+        from hermes_cli.plugins_cmd import _get_enabled_set, _save_enabled_set
+    except Exception as exc:
+        logger.debug("cannot enable plugin %s: %s", plugin_name, exc)
+        return
+
+    enabled = _get_enabled_set()
+    if plugin_name in enabled:
+        return
+    enabled.add(plugin_name)
+    _save_enabled_set(enabled)
+    print()
+    print_success(
+        f"Enabled plugin '{plugin_name}' for {platform_label}. "
+        "Takes effect on next session."
+    )
+
+
+def _configure_platform(platform: dict) -> None:
+    """Run the setup flow for a built-in or registry-backed platform."""
+    entry = platform.get("_registry_entry")
+    if platform.get("needs_enable") and entry is not None and entry.plugin_name:
+        _enable_plugin_for_platform(entry.plugin_name, entry.label)
+
+    if entry is not None and entry.setup_fn is not None:
+        entry.setup_fn()
+        return
+
+    setup_fn = _builtin_setup_fn(platform["key"])
+    if setup_fn is not None:
+        setup_fn()
+        return
+
+    if platform.get("vars"):
+        _setup_standard_platform(platform)
+        return
+
+    label = platform.get("label", platform["key"])
+    emoji = platform.get("emoji", "")
+    print()
+    print(color(f"  --- {emoji} {label} Setup ---", Colors.CYAN))
+    required = entry.required_env if entry else []
+    if required:
+        print_info(f"  Set these env vars in ~/.hermes/.env: {', '.join(required)}")
+    else:
+        print_info(
+            f"  Configure {label} in config.yaml under "
+            f"gateway.platforms.{platform['key']}"
+        )
+    if platform.get("install_hint"):
+        print_info(f"  {platform['install_hint']}")
 
 
 def gateway_setup():
